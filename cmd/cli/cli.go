@@ -24,6 +24,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/Masterminds/semver/v3"
 	"github.com/cuonglm/osinfo"
@@ -48,8 +49,8 @@ const selfCheckInternalTestDomain = "ctrld" + loopTestDomain
 const (
 	windowsForwardersFilename = ".forwarders.txt"
 	oldBinSuffix              = "_previous"
-	oldLogSuffix              = ".1"
 	msgExit                   = "$$EXIT$$"
+	shutdownTimeout           = 10 * time.Second
 )
 
 var (
@@ -140,11 +141,36 @@ func initCLI() {
 	initClientsCmd()
 	initUpgradeCmd()
 	initLogCmd()
+	initDiagCmd()
 }
 
 // isMobile reports whether the current OS is a mobile platform.
-func isMobile() bool {
+var isMobile = func() bool {
 	return runtime.GOOS == "android" || runtime.GOOS == "ios"
+}
+
+var (
+	networkUp = ctrldnet.Up
+	newRouter = router.New
+)
+
+func updateConfigInterceptMode(cfg *ctrld.Config, mode string) bool {
+	desired := ""
+	switch mode {
+	case "dns", "hard":
+		desired = mode
+	case "off":
+		desired = ""
+	case "":
+		return false
+	default:
+		return false
+	}
+	if cfg.Service.InterceptMode == desired {
+		return false
+	}
+	cfg.Service.InterceptMode = desired
+	return true
 }
 
 // isAndroid reports whether the current OS is Android.
@@ -164,8 +190,12 @@ func isStableVersion(vs string) bool {
 // RunCobraCommand runs ctrld cli.
 func RunCobraCommand(cmd *cobra.Command) {
 	noConfigStart = isNoConfigStart(cmd)
-	checkStrFlagEmpty(cmd, cdUidFlagName)
-	checkStrFlagEmpty(cmd, cdOrgFlagName)
+	if !checkStrFlagEmpty(cmd, cdUidFlagName) {
+		return
+	}
+	if !checkStrFlagEmpty(cmd, cdOrgFlagName) {
+		return
+	}
 	run(nil, make(chan struct{}))
 }
 
@@ -204,7 +234,8 @@ func CheckDeactivationPin(pin int64, stopCh chan struct{}) int {
 // run runs ctrld cli with given app callback and stop channel.
 func run(appCallback *AppCallback, stopCh chan struct{}) {
 	if stopCh == nil {
-		mainLog.Load().Fatal().Msg("stopCh is nil")
+		failRunUnclassified(mainLog.Load().Error(), "run() called with a nil stop channel", nil)
+		return
 	}
 	waitCh := make(chan struct{})
 	p := &prog{
@@ -216,6 +247,8 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 		dnsWatcherStopCh: make(chan struct{}),
 		apiReloadCh:      make(chan *ctrld.Config),
 		apiForceReloadCh: make(chan struct{}),
+		runDone:          make(chan struct{}),
+		runAbortCh:       make(chan struct{}),
 		cfg:              &cfg,
 		appCallback:      appCallback,
 	}
@@ -242,23 +275,28 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 	} else {
 		mainLog.Load().Warn().Err(err).Msgf("unable to resolve socket address: %s", sockPath)
 	}
-	notifyExitToLogServer := func() {
-		if p.logConn != nil {
-			_, _ = p.logConn.Write([]byte(msgExit))
-		}
-	}
 
 	if daemon && runtime.GOOS == "windows" {
-		mainLog.Load().Fatal().Msg("Cannot run in daemon mode. Please install a Windows service.")
+		failRunUnclassified(mainLog.Load().Error(), "cannot run in daemon mode; please install a Windows service", p.notifyExitToLogServer)
+		return
 	}
 
-	if !daemon {
+	switch {
+	case isMobile():
+		defer p.finishRun()
+		// There is no OS service manager here, and s.Run parks a goroutine on a
+		// signal that never arrives, leaking one per start/stop cycle.
+		if err := p.Start(nil); err != nil {
+			mainLog.Load().Fatal().Err(err).Msg("failed to start ctrld")
+		}
+	case !daemon:
 		// We need to call s.Run() as soon as possible to response to the OS manager, so it
 		// can see ctrld is running and don't mark ctrld as failed service.
 		go func() {
 			s, err := newService(p, svcConfig)
 			if err != nil {
-				mainLog.Load().Fatal().Err(err).Msg("failed create new service")
+				failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to create new service: %v", err), p.notifyExitToLogServer)
+				return
 			}
 			if err := s.Run(); err != nil {
 				mainLog.Load().Error().Err(err).Msg("failed to start service")
@@ -269,20 +307,22 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 	tryReadingConfig(writeDefaultConfig)
 
 	if err := readBase64Config(configBase64); err != nil {
-		mainLog.Load().Fatal().Err(err).Msg("failed to read base64 config")
+		failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to read base64 config: %v", err), p.notifyExitToLogServer)
+		return
 	}
 	processNoConfigFlags(noConfigStart)
 
 	// After s.Run() was called, if ctrld is going to be terminated for any reason,
 	// write msgExit to p.logConn so others (like "ctrld start") won't have to wait for timeout.
 	p.mu.Lock()
-	if err := v.Unmarshal(&cfg); err != nil {
-		notifyExitToLogServer()
-		mainLog.Load().Fatal().Msgf("failed to unmarshal config: %v", err)
-	}
+	unmarshalErr := v.Unmarshal(&cfg)
 	p.mu.Unlock()
+	if unmarshalErr != nil {
+		failRunUnclassified(mainLog.Load().Error(), fmt.Sprintf("failed to unmarshal config: %v", unmarshalErr), p.notifyExitToLogServer)
+		return
+	}
 
-	processLogAndCacheFlags()
+	processLogAndCacheFlags(v, &cfg)
 
 	// Log config do not have thing to validate, so it's safe to init log here,
 	// so it's able to log information in processCDFlags.
@@ -292,12 +332,12 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 	mainLog.Load().Info().Msgf("os: %s", osVersion())
 
 	// Wait for network up.
-	if !ctrldnet.Up() {
-		notifyExitToLogServer()
-		mainLog.Load().Fatal().Msg("network is not up yet")
+	if !networkUp() {
+		failRunUnclassified(mainLog.Load().Error(), "network is not up yet", p.notifyExitToLogServer)
+		return
 	}
 
-	p.router = router.New(&cfg, cdUID != "")
+	p.router = newRouter(&cfg, cdUID != "")
 	cs, err := newControlServer(filepath.Join(sockDir, ControlSocketName()))
 	if err != nil {
 		mainLog.Load().Warn().Err(err).Msg("could not create control server")
@@ -308,92 +348,105 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 	// time for validating server certificate. Some routers need NTP synchronization
 	// to set the current time, so this check must happen before processCDFlags.
 	if err := p.router.PreRun(); err != nil {
-		notifyExitToLogServer()
-		mainLog.Load().Fatal().Err(err).Msg("failed to perform router pre-run check")
+		failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to perform router pre-run check: %v", err), p.notifyExitToLogServer)
+		return
 	}
 
 	oldLogPath := cfg.Service.LogPath
 	if uid := cdUIDFromProvToken(); uid != "" {
 		cdUID = uid
+		p.initLoggingAfterProvisioning()
 	}
 	if cdUID != "" {
-		validateCdUpstreamProtocol()
-		if rc, err := processCDFlags(&cfg); err != nil {
+		if !validateCdUpstreamProtocol(p.notifyExitToLogServer) {
+			return
+		}
+		// Bound API preflight by the service lifetime. Without this, a stop request
+		// arriving while the API is unreachable leaves this retry/backoff loop running
+		// after "service stopped" was logged, so the process keeps working on behalf of
+		// a service the OS considers stopped.
+		pf := runAPIPreflight(p.stopCh, &cfg)
+		switch {
+		case pf.stopRequested:
+			// Stop requested during preflight, whether or not the fetch itself
+			// succeeded. A successful fetch does not entitle startup to continue: the
+			// operator asked for a stop, and carrying on would set up listeners and
+			// interception for a service the OS already considers stopping.
+			//
+			// Exit the way a normal stop does: no Fatal, so the OS service manager does
+			// not see a failed start and apply its restart policy to a service the
+			// operator just asked to stop.
+			mainLog.Load().Notice().Msg("stop requested while fetching resolver config, shutting down")
+			p.notifyExitToLogServer()
+			return
+		case pf.err != nil:
 			if isMobile() {
-				appCallback.Exit(err.Error())
+				appCallback.Exit(pf.err.Error())
 				return
 			}
 
-			cdLogger := mainLog.Load().With().Str("mode", "cd").Logger()
-			// Performs self-uninstallation if the ControlD device does not exist.
-			var uer *controld.ErrorResponse
-			if errors.As(err, &uer) && uer.ErrorField.Code == controld.InvalidConfigCode {
-				_ = uninstallInvalidCdUID(p, cdLogger, false)
-			}
-			notifyExitToLogServer()
-			cdLogger.Fatal().Err(err).Msg("failed to fetch resolver config")
-		} else {
+			handleAPIPreflightFailure(p, pf.err, p.notifyExitToLogServer)
+			return
+		default:
 			p.mu.Lock()
-			p.rc = rc
+			p.rc = pf.rc
 			p.mu.Unlock()
 		}
 	}
 
-	updated := updateListenerConfig(&cfg, notifyExitToLogServer)
+	updated := updateListenerConfig(&cfg, p.notifyExitToLogServer)
+
+	// Bootstrap and listener binding both succeeded, so an earlier run's
+	// recorded failure no longer describes this install.
+	clearProvisionResult()
 
 	if cdUID != "" {
-		processLogAndCacheFlags()
+		processLogAndCacheFlags(v, &cfg)
+	}
+
+	// Keep config and the explicit CLI/service mode in sync. In particular, "off"
+	// must clear a previously persisted dns/hard value or the next service start
+	// would silently re-enable interception from config.
+	if updateConfigInterceptMode(&cfg, interceptMode) {
+		updated = true
+		mainLog.Load().Info().Msgf("writing intercept_mode = %q to config (requested %q)", cfg.Service.InterceptMode, interceptMode)
 	}
 
 	if updated {
 		if err := writeConfigFile(&cfg); err != nil {
-			notifyExitToLogServer()
-			mainLog.Load().Fatal().Err(err).Msg("failed to write config file")
-		} else {
-			mainLog.Load().Info().Msg("writing config file to: " + defaultConfigFile)
+			failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to write config file: %v", err), p.notifyExitToLogServer)
+			return
 		}
+		mainLog.Load().Info().Msg("writing config file to: " + defaultConfigFile)
 	}
 
 	if newLogPath := cfg.Service.LogPath; newLogPath != "" && oldLogPath != newLogPath {
-		// After processCDFlags, log config may change, so reset mainLog and re-init logging.
-		l := zerolog.New(io.Discard)
-		mainLog.Store(&l)
-
-		// Copy logs written so far to new log file if possible.
-		if buf, err := os.ReadFile(oldLogPath); err == nil {
-			if err := os.WriteFile(newLogPath, buf, os.FileMode(0o600)); err != nil {
-				mainLog.Load().Warn().Err(err).Msg("could not copy old log file")
-			}
-		}
-		initLoggingWithBackup(false)
+		p.switchLogPath(oldLogPath, newLogPath)
 	}
 
 	if err := validateConfig(&cfg); err != nil {
-		notifyExitToLogServer()
-		os.Exit(1)
+		failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("invalid config: %v", err), p.notifyExitToLogServer)
+		return
 	}
 	initCache()
 
 	if daemon {
 		exe, err := os.Executable()
 		if err != nil {
-			mainLog.Load().Error().Err(err).Msg("failed to find the binary")
-			notifyExitToLogServer()
-			os.Exit(1)
+			failRunUnclassified(mainLog.Load().Error().Err(err), "failed to find the binary", p.notifyExitToLogServer)
+			return
 		}
 		curDir, err := os.Getwd()
 		if err != nil {
-			mainLog.Load().Error().Err(err).Msg("failed to get current working directory")
-			notifyExitToLogServer()
-			os.Exit(1)
+			failRunUnclassified(mainLog.Load().Error().Err(err), "failed to get current working directory", p.notifyExitToLogServer)
+			return
 		}
 		// If running as daemon, re-run the command in background, with daemon off.
 		cmd := exec.Command(exe, append(os.Args[1:], "-d=false")...)
 		cmd.Dir = curDir
 		if err := cmd.Start(); err != nil {
-			mainLog.Load().Error().Err(err).Msg("failed to start process as daemon")
-			notifyExitToLogServer()
-			os.Exit(1)
+			failRunUnclassified(mainLog.Load().Error().Err(err), "failed to start process as daemon", p.notifyExitToLogServer)
+			return
 		}
 		mainLog.Load().Info().Int("pid", cmd.Process.Pid).Msg("DNS proxy started")
 		os.Exit(0)
@@ -441,22 +494,14 @@ func run(appCallback *AppCallback, stopCh chan struct{}) {
 	p.onStopped = append(p.onStopped, func() {
 		// restore static DNS settings or DHCP
 		p.resetDNS(false, true)
-		// Iterate over all physical interfaces and restore static DNS if a saved static config exists.
-		withEachPhysicalInterfaces("", "restore static DNS", func(i *net.Interface) error {
-			file := savedStaticDnsSettingsFilePath(i)
-			if _, err := os.Stat(file); err == nil {
-				if err := restoreDNS(i); err != nil {
-					mainLog.Load().Error().Err(err).Msgf("Could not restore static DNS on interface %s", i.Name)
-				} else {
-					mainLog.Load().Debug().Msgf("Restored static DNS on interface %s successfully", i.Name)
-				}
-			}
-			return nil
-		})
+		restoreSavedStaticDNS("", false)
 	})
 
 	close(waitCh)
 	<-stopCh
+	if !isMobile() {
+		p.finishRun()
+	}
 }
 
 func writeConfigFile(cfg *ctrld.Config) error {
@@ -628,6 +673,19 @@ const defaultDeactivationPin = -1
 // cdDeactivationPin is used in cd mode to decide whether stop and uninstall commands can be run.
 var cdDeactivationPin atomic.Int64
 
+// Brute-force protection for the deactivation PIN endpoint on the control socket.
+// After deactivationMaxFailedAttempts consecutive wrong PINs, further attempts are
+// rejected for deactivationLockoutSeconds. Counter resets on a correct PIN.
+const (
+	deactivationMaxFailedAttempts = 5
+	deactivationLockoutSeconds    = 60
+)
+
+var (
+	deactivationFailedAttempts atomic.Int64
+	deactivationLockedUntil    atomic.Int64
+)
+
 func init() {
 	cdDeactivationPin.Store(defaultDeactivationPin)
 }
@@ -637,18 +695,271 @@ func deactivationPinSet() bool {
 	return cdDeactivationPin.Load() != defaultDeactivationPin
 }
 
-func processCDFlags(cfg *ctrld.Config) (*controld.ResolverConfig, error) {
+// fetchResolverConfig is a test seam for the ControlD resolver-config API call.
+var fetchResolverConfig = controld.FetchResolverConfig
+
+// apiPreflight is the outcome of the API preflight fetch: the resolver config, the
+// error if any, and whether the service was asked to stop while it ran.
+type apiPreflight struct {
+	rc            *controld.ResolverConfig
+	err           error
+	stopRequested bool
+}
+
+// runAPIPreflight fetches the ControlD resolver config bounded by the service
+// lifetime, and reports whether a stop was requested while it ran.
+//
+// The distinction matters because the caller does very different things with it: a stop
+// exits quietly, while a failure self-uninstalls a deleted device, surfaces the error to
+// a mobile app, and reports a failed start to the service manager.
+//
+// stopRequested must not be derived from the context once it has been cancelled.
+// context.CancelFunc sets ctx.Err() unconditionally, so reading it after the cancel
+// classifies *every* failure - a deleted device, an exhausted retry, a mobile caller
+// with no stop channel - as an operator stop. Reading the stop channel directly is also
+// independent of whether the context's watcher goroutine has been scheduled yet.
+func runAPIPreflight(stopCh <-chan struct{}, cfg *ctrld.Config) apiPreflight {
+	rc, err := fetchCDConfigBoundedBy(stopCh, cfg)
+	return apiPreflight{rc: rc, err: err, stopRequested: stopRequested(stopCh)}
+}
+
+// permanentAPIRejection reports whether err is the API refusing this request in a way
+// that a restart cannot change, and returns the rejection when it is.
+//
+// The type alone does not answer this. controld builds an *ErrorResponse for *any*
+// non-200 whose body decodes, so a 502 from a load balancer and a 404 for a deleted
+// device arrive as the same Go type. Treating both as permanent would let a few minutes
+// of API trouble stop ctrld on every host with no service-manager retry behind it, which
+// is strictly worse than the abnormal exit it replaced.
+//
+// So the HTTP status decides, and only a client-error status counts:
+//
+//   - 4xx: the API examined this request and refused it - a deleted device, a revoked
+//     token, a malformed UID. The same request will be refused again.
+//   - 408 and 429 are the exceptions: they are the API asking for another attempt later.
+//   - 5xx, or no recorded status, says nothing about this configuration. Retry.
+func permanentAPIRejection(err error) (*controld.ErrorResponse, bool) {
+	var uer *controld.ErrorResponse
+	if !errors.As(err, &uer) {
+		return nil, false
+	}
+	switch uer.StatusCode {
+	case http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return nil, false
+	}
+	if uer.StatusCode < 400 || uer.StatusCode >= 500 {
+		return nil, false
+	}
+	return uer, true
+}
+
+// apiFailureCode maps a bootstrap preflight error to its provisioning code.
+// A deleted device gets its own code because it triggers self-uninstall; a
+// permanent rejection with a known token reason gets its own code; other
+// permanent rejections are generic; anything else counts as reachability
+// trouble worth retrying.
+func apiFailureCode(err error) (provisionFailureCode, bool) {
+	if err == nil {
+		return "", false
+	}
+	var uer *controld.ErrorResponse
+	if errors.As(err, &uer) && uer.ErrorField.Code == controld.InvalidConfigCode {
+		return provisionCodeAPIDeviceInvalid, true
+	}
+	if rejection, ok := permanentAPIRejection(err); ok {
+		if code, ok := tokenFailureCodeForReason(rejection.ErrorField.Metadata.Reason); ok {
+			return code, true
+		}
+		return provisionCodeAPIRejected, true
+	}
+	return provisionCodeAPIUnreachable, true
+}
+
+// tokenFailureCodeForReason maps error.metadata.reason on a provisioning-token
+// rejection to its failure code. An empty or unrecognized reason is not
+// classified here; the caller falls back to the generic rejection code.
+func tokenFailureCodeForReason(reason string) (provisionFailureCode, bool) {
+	switch reason {
+	case controld.ReasonTokenInvalid:
+		return provisionCodeTokenInvalid, true
+	case controld.ReasonTokenExpired:
+		return provisionCodeTokenExpired, true
+	case controld.ReasonTokenLimitReached:
+		return provisionCodeTokenLimitReached, true
+	case controld.ReasonTokenDisabled:
+		return provisionCodeTokenDisabled, true
+	default:
+		return "", false
+	}
+}
+
+// tokenRejectionMessage returns the human message for a TOKEN_* code: what is
+// wrong with the provisioning code and one concrete next action. Empty for
+// any other code, so callers know to fall back to a generic message. Never
+// includes the token itself.
+func tokenRejectionMessage(code provisionFailureCode) string {
+	switch code {
+	case provisionCodeTokenInvalid:
+		return "the provisioning code is not valid; check the code and re-enter it exactly as given"
+	case provisionCodeTokenExpired:
+		return "the provisioning code has expired; get a new provisioning code from your administrator"
+	case provisionCodeTokenLimitReached:
+		return "the provisioning code reached its device limit; free up a device slot or use a different code"
+	case provisionCodeTokenDisabled:
+		return "the provisioning code was invalidated; download a profile from an active provisioning code"
+	default:
+		return ""
+	}
+}
+
+// provisionTokenFailureMessage returns the result-file message for a failed
+// provision-token exchange: a token-specific message when the API gave a
+// known reason, the generic exchange-failure summary otherwise.
+func provisionTokenFailureMessage(code provisionFailureCode, err error) string {
+	if msg := tokenRejectionMessage(code); msg != "" {
+		return msg
+	}
+	return fmt.Sprintf("provision token exchange failed: %v", err)
+}
+
+// apiRejectionSummary reports the HTTP status only. The API's raw error body
+// can echo back the value the caller sent, so it stays out of the artifact.
+func apiRejectionSummary(statusCode int) string {
+	return fmt.Sprintf("ControlD API rejected this configuration (HTTP status %d)", statusCode)
+}
+
+// provisionSecrets lists every secret-bearing value to strip from provisioning
+// artifacts, including both parts of a composite "<uid>/<clientID>" --cd
+// value, which the API may echo back separately. redactSecrets drops the
+// values that are too short to redact, so a client ID such as "os" leaves the
+// words of the message alone.
+func provisionSecrets() []string {
+	uid, clientID := controld.ParseRawUID(cdUID)
+	return []string{cdUID, cdOrg, uid, clientID}
+}
+
+// uninstallInvalidCdUIDFn is a var so tests can observe the self-uninstall
+// without driving the OS service manager.
+var uninstallInvalidCdUIDFn = uninstallInvalidCdUID
+
+// handleAPIPreflightFailure reports a failed resolver-config fetch. A deleted
+// device self-uninstalls; it and any other permanent rejection return cleanly
+// so a config problem cannot burn the service manager's restart budget (on
+// Windows those restarts are what bring enforcement back after a real crash).
+// Anything else exits nonzero through failProvision so the manager retries.
+func handleAPIPreflightFailure(p *prog, err error, notify func()) {
+	cdLogger := mainLog.Load().With().Str("mode", "cd").Logger()
+	code, _ := apiFailureCode(err)
+	var uer *controld.ErrorResponse
+	if errors.As(err, &uer) && uer.ErrorField.Code == controld.InvalidConfigCode {
+		r := newProvisionResult(code, apiRejectionSummary(uer.StatusCode), nil, provisionSecrets()...)
+		if werr := writeProvisionResult(r); werr != nil {
+			cdLogger.Warn().Err(werr).Msg("could not persist provision result")
+		}
+		_ = uninstallInvalidCdUIDFn(p, cdLogger, false)
+		cdLogger.Error().Err(err).Int("status", uer.StatusCode).Msg("failed to fetch resolver config, the device no longer exists")
+		cdLogger.Error().Msg(r.failureLine())
+		notify()
+		return
+	}
+	if rejection, ok := permanentAPIRejection(err); ok {
+		r := newProvisionResult(code, apiRejectionSummary(rejection.StatusCode), nil, provisionSecrets()...)
+		if werr := writeProvisionResult(r); werr != nil {
+			cdLogger.Warn().Err(werr).Msg("could not persist provision result")
+		}
+		cdLogger.Error().Err(err).Int("status", rejection.StatusCode).Msg("failed to fetch resolver config, the API rejected this configuration")
+		cdLogger.Error().Msg(r.failureLine())
+		notify()
+		return
+	}
+	cdLogger.Error().Err(err).Msg("failed to fetch resolver config")
+	failProvision(newProvisionResult(code, fmt.Sprintf("failed to fetch resolver config: %v", err), nil, provisionSecrets()...), notify)
+}
+
+// processCDFlagsFn is the API fetch, indirected so the lifetime binding around it can be
+// tested without reaching the network.
+var processCDFlagsFn = processCDFlags
+
+// fetchCDConfigBoundedBy runs the API fetch bounded by stopCh, so a fetch that cannot
+// reach the API stops when the service is asked to stop instead of working on behalf of a
+// service the OS already considers stopped. The derived context is always cancelled, which
+// releases the goroutine watching stopCh.
+func fetchCDConfigBoundedBy(stopCh <-chan struct{}, cfg *ctrld.Config) (*controld.ResolverConfig, error) {
+	ctx, cancel := contextFromStopCh(stopCh)
+	defer cancel()
+	return processCDFlagsFn(ctx, cfg)
+}
+
+// fetchCDConfigBoundedByLifetime is the reload path's fetch. Reload binds the same stop
+// primitives as startup - it used to wire them up itself, where a dropped cancel or the
+// wrong channel would have failed nothing.
+func (p *prog) fetchCDConfigBoundedByLifetime(cfg *ctrld.Config) (*controld.ResolverConfig, error) {
+	return fetchCDConfigBoundedBy(p.stopCh, cfg)
+}
+
+// stopRequested reports whether stopCh has been closed. A nil channel - mobile passes
+// none - blocks forever, so the default case is taken and it reads as "no stop".
+func stopRequested(stopCh <-chan struct{}) bool {
+	select {
+	case <-stopCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// contextFromStopCh returns a context that is cancelled when stopCh closes, so
+// long-running startup work stops as soon as the service is asked to stop. The
+// returned cancel func must be called to release the watcher goroutine.
+func contextFromStopCh(stopCh <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	if stopCh == nil {
+		return ctx, cancel
+	}
+	go func() {
+		select {
+		case <-stopCh:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
+// processCDFlags fetches the ControlD configuration for cdUID and applies it to cfg.
+//
+// ctx bounds the bootstrap-DNS retry loop below. That loop retries indefinitely by
+// design (a device with no network yet must eventually come up), so it must be
+// cancellable: otherwise a stop request during preflight is ignored and the process
+// keeps retrying after the service reports itself stopped.
+func processCDFlags(ctx context.Context, cfg *ctrld.Config) (*controld.ResolverConfig, error) {
 	logger := mainLog.Load().With().Str("mode", "cd").Logger()
 	logger.Info().Msgf("fetching Controld D configuration from API: %s", cdUID)
 	bo := backoff.NewBackoff("processCDFlags", logf, 30*time.Second)
 	bo.LogLongerThan = 30 * time.Second
-	ctx := context.Background()
-	resolverConfig, err := controld.FetchResolverConfig(cdUID, rootCmd.Version, cdDev)
+
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	req := &controld.ResolverConfigRequest{
+		RawUID:   cdUID,
+		Version:  rootCmd.Version,
+		Metadata: ctrld.SystemMetadataRuntime(ctx),
+	}
+	resolverConfig, err := fetchResolverConfig(ctx, req, cdDev)
 	for {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			logger.Debug().Msg("resolver config fetch cancelled")
+			return nil, ctxErr
+		}
 		if errUrlNetworkError(err) {
 			bo.BackOff(ctx, err)
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				logger.Debug().Msg("resolver config fetch cancelled during backoff")
+				return nil, ctxErr
+			}
 			logger.Warn().Msg("could not fetch resolver using bootstrap DNS, retrying...")
-			resolverConfig, err = controld.FetchResolverConfig(cdUID, rootCmd.Version, cdDev)
+			resolverConfig, err = fetchResolverConfig(ctx, req, cdDev)
 			continue
 		}
 		break
@@ -680,7 +991,10 @@ func processCDFlags(cfg *ctrld.Config) (*controld.ResolverConfig, error) {
 				return resolverConfig, nil
 			}
 		}
-		mainLog.Load().Warn().Err(err).Msg("disregarding invalid custom config")
+		// cfgErr, not err: err is the resolver-config fetch error from above, which is
+		// nil on every path that reaches here, so logging it said nothing about why the
+		// custom config was rejected.
+		mainLog.Load().Warn().Err(cfgErr).Msg("disregarding invalid custom config")
 	}
 
 	bootstrapIP := func(endpoint string) string {
@@ -718,11 +1032,37 @@ func processCDFlags(cfg *ctrld.Config) (*controld.ResolverConfig, error) {
 	}
 	cfg.Listener["0"] = lc
 
+	// Organization Internal Domains. Applied after the Magic Folder excludes
+	// above, so an excluded domain keeps its exclusion, and before the
+	// platform AD auto-detection in addExtraSplitDnsRule, which skips any
+	// domain that already has a rule.
+	if summary := applyInternalDomains(cfg, resolverConfig.SplitDNS); !summary.empty() {
+		logInternalDomainsSummary(logger, summary)
+	}
+
 	// Set default value.
 	setListenerDefaultValue(cfg)
 	setNetworkDefaultValue(cfg)
 
 	return resolverConfig, nil
+}
+
+// logInternalDomainsSummary reports what the Internal Domains list produced,
+// as counts only. Domain names and resolver addresses are private to the
+// organization and stay at debug level.
+func logInternalDomainsSummary(logger zerolog.Logger, summary internalDomainsSummary) {
+	event := logger.Info()
+	if summary.skipped > 0 || summary.preempted > 0 {
+		event = logger.Warn()
+	}
+	event.Int("domains", summary.domains).
+		Int("os_resolver", summary.osMode).
+		Int("explicit_resolver", summary.explicit).
+		Int("explicit_resolver_only", summary.only).
+		Int("resolvers", summary.resolvers).
+		Int("skipped", summary.skipped).
+		Int("preempted", summary.preempted).
+		Msg("applied organization Internal Domains")
 }
 
 // setListenerDefaultValue sets the default value for cfg.Listener if none existed.
@@ -780,7 +1120,8 @@ func processListenFlag() {
 	})
 }
 
-func processLogAndCacheFlags() {
+// processLogAndCacheFlags processes log and cache related flags
+func processLogAndCacheFlags(v *viper.Viper, cfg *ctrld.Config) {
 	if logPath != "" {
 		cfg.Service.LogPath = logPath
 	}
@@ -795,23 +1136,38 @@ func processLogAndCacheFlags() {
 	v.Set("service", cfg.Service)
 }
 
+// errInterfaceNotFound reports that the named interface does not exist on the
+// host. Callers use errors.Is to tell this apart from a lookup that failed for
+// another reason, because an interface that is simply gone (an unplugged
+// adapter, a torn down tether) is an expected outcome rather than a failure.
+var errInterfaceNotFound = errors.New("interface not found")
+
+// foreachInterface enumerates the host network interfaces. It is a variable so
+// tests can make enumeration fail without depending on the host.
+var foreachInterface = netmon.ForeachInterface
+
 func netInterface(ifaceName string) (*net.Interface, error) {
-	if ifaceName == "auto" {
+	if ifaceName == autoIface {
 		ifaceName = defaultIfaceName()
 	}
 	var iface *net.Interface
-	err := netmon.ForeachInterface(func(i netmon.Interface, prefixes []netip.Prefix) {
+	err := foreachInterface(func(i netmon.Interface, prefixes []netip.Prefix) {
 		if i.Name == ifaceName {
 			iface = i.Interface
 		}
 	})
+	if err != nil {
+		// Enumeration itself failed, so the interface cannot be reported as
+		// missing: nothing was positively established about it.
+		return nil, err
+	}
 	if iface == nil {
-		return nil, errors.New("interface not found")
+		return nil, errInterfaceNotFound
 	}
 	if _, err := patchNetIfaceName(iface); err != nil {
 		return nil, err
 	}
-	return iface, err
+	return iface, nil
 }
 
 func defaultIfaceName() string {
@@ -947,11 +1303,7 @@ func selfCheckResolveDomain(ctx context.Context, addr, scope string, domain stri
 	}
 	mainLog.Load().Debug().Msgf("self-check against %q failed", domain)
 	// Ping all upstreams to provide better error message to users.
-	for name, uc := range cfg.Upstream {
-		if err := uc.ErrorPing(); err != nil {
-			mainLog.Load().Err(err).Msgf("failed to connect to upstream.%s, endpoint: %s", name, uc.Endpoint)
-		}
-	}
+	logUpstreamPingFailures(cfg.Upstream)
 	marker := strings.Repeat("=", 32)
 	mainLog.Load().Debug().Msg(marker)
 	mainLog.Load().Debug().Msgf("listener address       : %s", addr)
@@ -966,7 +1318,33 @@ func selfCheckResolveDomain(ctx context.Context, addr, scope string, domain stri
 	return errSelfCheckNoAnswer
 }
 
-func userHomeDir() (string, error) {
+// upstreamPingFn is a var so tests can drive the self-check report without a
+// network probe.
+var upstreamPingFn = (*ctrld.UpstreamConfig).ErrorPing
+
+// logUpstreamPingFailures names the upstreams that do not answer after a
+// failed self-check, so the user learns which one is unreachable. The config
+// key and the endpoint are operator text that can hold a token, so both stay
+// at debug and the retained line names the upstream by its bounded name.
+func logUpstreamPingFailures(upstreams map[string]*ctrld.UpstreamConfig) {
+	for name, uc := range upstreams {
+		err := upstreamPingFn(uc)
+		if err == nil {
+			continue
+		}
+		logUpstreamProbeFailure(upstreamPrefix+name, uc, err, mainLog.Load().Error, "failed to connect to the upstream")
+	}
+}
+
+// unixServiceHomeDir is where a ctrld service with root rights keeps its
+// files on macOS, Linux, and the BSDs.
+const unixServiceHomeDir = "/etc/controld"
+
+// serviceHomeDir returns the directory where a ctrld service with root or
+// administrator rights keeps its files. It has no fallback to the home
+// directory of the current user. A caller without root that only reads can
+// thus look where the service wrote.
+func serviceHomeDir() (string, error) {
 	dir, err := router.HomeDir()
 	if err != nil {
 		return "", err
@@ -988,7 +1366,17 @@ func userHomeDir() (string, error) {
 	if isMobile() {
 		return homedir, nil
 	}
-	dir = "/etc/controld"
+	return unixServiceHomeDir, nil
+}
+
+// userHomeDir is serviceHomeDir with a fallback: when the current user
+// cannot write to the unix service home, it returns the home directory of
+// that user instead.
+func userHomeDir() (string, error) {
+	dir, err := serviceHomeDir()
+	if err != nil || dir != unixServiceHomeDir {
+		return dir, err
+	}
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return os.UserHomeDir() // fallback to user home directory
 	}
@@ -1082,23 +1470,7 @@ func uninstall(p *prog, s service.Service) {
 		}
 		// restore static DNS settings or DHCP
 		p.resetDNS(false, true)
-
-		// Iterate over all physical interfaces and restore DNS if a saved static config exists.
-		withEachPhysicalInterfaces(p.runningIface, "restore static DNS", func(i *net.Interface) error {
-			file := savedStaticDnsSettingsFilePath(i)
-			if _, err := os.Stat(file); err == nil {
-				if err := restoreDNS(i); err != nil {
-					mainLog.Load().Error().Err(err).Msgf("Could not restore static DNS on interface %s", i.Name)
-				} else {
-					mainLog.Load().Debug().Msgf("Restored static DNS on interface %s successfully", i.Name)
-					err = os.Remove(file)
-					if err != nil {
-						mainLog.Load().Debug().Err(err).Msgf("Could not remove saved static DNS file for interface %s", i.Name)
-					}
-				}
-			}
-			return nil
-		})
+		restoreSavedStaticDNS(p.runningIface, true)
 
 		if router.Name() != "" {
 			mainLog.Load().Debug().Msg("Router cleanup")
@@ -1109,6 +1481,33 @@ func uninstall(p *prog, s service.Service) {
 		mainLog.Load().Notice().Msg("Service uninstalled")
 		return
 	}
+}
+
+var restoreSavedStaticDNSInterfacesFn = withEachPhysicalInterfaces
+var restoreSavedStaticDNSRestoreFn = restoreDNS
+
+// restoreSavedStaticDNS restores DNS from saved static config files on physical interfaces.
+func restoreSavedStaticDNS(excludeIfaceName string, removeSaved bool) {
+	restoreSavedStaticDNSInterfacesFn(excludeIfaceName, "restore static DNS", func(i *net.Interface) error {
+		if !interceptTargetAllowsStaticRestore(i.Name) {
+			mainLog.Load().Debug().Msgf("Saved static DNS restore skipped on interface %s: intercept target cleanup is pending or ownership is unreadable", i.Name)
+			return nil
+		}
+		file := savedStaticDnsSettingsFilePath(i)
+		if _, err := os.Stat(file); err == nil {
+			if err := restoreSavedStaticDNSRestoreFn(i); err != nil {
+				mainLog.Load().Error().Err(err).Msgf("Could not restore static DNS on interface %s", i.Name)
+			} else {
+				mainLog.Load().Debug().Msgf("Restored static DNS on interface %s successfully", i.Name)
+				if removeSaved {
+					if err := os.Remove(file); err != nil {
+						mainLog.Load().Debug().Err(err).Msgf("Could not remove saved static DNS file for interface %s", i.Name)
+					}
+				}
+			}
+		}
+		return nil
+	})
 }
 
 func validateConfig(cfg *ctrld.Config) error {
@@ -1146,6 +1545,8 @@ func fieldErrorMsg(fe validator.FieldError) string {
 		return fmt.Sprintf("minimum len: %q", fe.Param())
 	case "gte":
 		return fmt.Sprintf("must be greater than or equal to: %s", fe.Param())
+	case "lte":
+		return fmt.Sprintf("must be less than or equal to: %s", fe.Param())
 	case "cidr":
 		return fmt.Sprintf("invalid value: %s", fe.Value())
 	case "required_unless", "required":
@@ -1213,10 +1614,131 @@ func updateListenerConfig(cfg *ctrld.Config, notifyToLogServerFunc func()) bool 
 	return updated
 }
 
+// tryUpdateListenerConfigIntercept handles listener binding for dns-intercept mode on macOS.
+// In intercept mode, pf redirects all outbound port-53 traffic to ctrld's listener,
+// so ctrld can safely listen on a non-standard port if port 53 is unavailable
+// (e.g., mDNSResponder holds *:53).
+//
+// Flow:
+//  1. If config has explicit (non-default) IP:port → use exactly that, no fallback
+//  2. Otherwise → try 127.0.0.1:53, then 127.0.0.1:5354, then fatal
+func tryUpdateListenerConfigIntercept(cfg *ctrld.Config, notifyFunc func(), fatal bool) (updated, ok bool) {
+	ok = true
+	lc := cfg.FirstListener()
+	if lc == nil {
+		return false, true
+	}
+
+	hasExplicitConfig := isExplicitInterceptListener(lc.IP, lc.Port)
+	if !hasExplicitConfig {
+		// Set defaults for intercept mode
+		if lc.IP == "" || lc.IP == "0.0.0.0" {
+			lc.IP = "127.0.0.1"
+			updated = true
+		}
+		if lc.Port == 0 {
+			lc.Port = 53
+			updated = true
+		}
+	}
+
+	// bindAttempts feeds the provisioning result detail. newProvisionResult
+	// caps it, so it grows freely here.
+	var bindAttempts []provisionBindAttempt
+	recordBindAttempt := func(addr, proto string, err error) {
+		if err != nil {
+			bindAttempts = append(bindAttempts, provisionBindAttempt{Addr: addr, Proto: proto, OSError: err.Error()})
+		}
+	}
+
+	tryListen := func(ip string, port int) bool {
+		addr := net.JoinHostPort(ip, strconv.Itoa(port))
+		udpLn, udpErr := net.ListenPacket("udp", addr)
+		if udpLn != nil {
+			udpLn.Close()
+		}
+		recordBindAttempt(addr, "udp", udpErr)
+		tcpLn, tcpErr := net.Listen("tcp", addr)
+		if tcpLn != nil {
+			tcpLn.Close()
+		}
+		recordBindAttempt(addr, "tcp", tcpErr)
+		return udpErr == nil && tcpErr == nil
+	}
+
+	addr := net.JoinHostPort(lc.IP, strconv.Itoa(lc.Port))
+	if tryListen(lc.IP, lc.Port) {
+		mainLog.Load().Debug().Msgf("DNS intercept: listener available at %s", addr)
+		return updated, true
+	}
+
+	mainLog.Load().Info().Msgf("DNS intercept: cannot bind %s", addr)
+
+	if hasExplicitConfig {
+		// User specified explicit address — don't guess, just fail
+		if fatal {
+			msg := fmt.Sprintf("DNS intercept: cannot listen on configured address %s", addr)
+			mainLog.Load().Error().Msg(msg)
+			failProvision(newProvisionResult(provisionCodeListenerAddrUnavail, msg, bindAttempts, provisionSecrets()...), notifyFunc)
+			return updated, false
+		}
+		return updated, false
+	}
+
+	// Fallback: try port 5354 (mDNSResponder likely holds *:53)
+	if tryListen("127.0.0.1", 5354) {
+		mainLog.Load().Info().Msg("DNS intercept: port 53 unavailable (likely mDNSResponder), using 127.0.0.1:5354")
+		lc.IP = "127.0.0.1"
+		lc.Port = 5354
+		return true, true
+	}
+
+	if fatal {
+		const msg = "DNS intercept: cannot bind 127.0.0.1:53 or 127.0.0.1:5354"
+		mainLog.Load().Error().Msg(msg)
+		failProvision(newProvisionResult(provisionCodeListenerBindFailed, msg, bindAttempts, provisionSecrets()...), notifyFunc)
+		return updated, false
+	}
+	return updated, false
+}
+
+func isExplicitInterceptListener(ip string, port int) bool {
+	if ip == "" || ip == "0.0.0.0" || port == 0 {
+		return false
+	}
+	// 127.0.0.1:53 is the default macOS DNS-intercept listener. It can appear
+	// in generated/custom Control D configs, but it should still be allowed to
+	// fall back to 127.0.0.1:5354 when mDNSResponder already owns port 53.
+	return !(ip == "127.0.0.1" && port == 53)
+}
+
+// listenerInterceptMode resolves the mode that selects the listener binding
+// strategy. An explicit "off" is final here, the same as in setDNS. A fallback
+// to the config value would select the intercept strategy from a stale
+// persisted mode on the first start after a revert to standard mode.
+func listenerInterceptMode(cfg *ctrld.Config) string {
+	if interceptMode == "" {
+		return cfg.Service.InterceptMode
+	}
+	return interceptMode
+}
+
 // tryUpdateListenerConfig tries updating listener config with a working one.
 // If fatal is true, and there's listen address conflicted, the function do
 // fatal error.
 func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, notifyFunc func(), fatal bool) (updated, ok bool) {
+	// In intercept mode (macOS), pf redirects all port-53 traffic to ctrld's listener,
+	// so ctrld can safely listen on a non-standard port. Use a simple two-attempt flow:
+	// 1. If config has explicit non-default IP:port, use exactly that
+	// 2. Otherwise: try 127.0.0.1:53, then 127.0.0.1:5354, then fatal
+	// This bypasses the full cd-mode listener probing loop entirely.
+	// dnsIntercept bool is derived later in prog.run(), but we need to know
+	// the intercept mode here to select the right listener probing strategy.
+	im := listenerInterceptMode(cfg)
+	if (im == "dns" || im == "hard") && runtime.GOOS == "darwin" {
+		return tryUpdateListenerConfigIntercept(cfg, notifyFunc, fatal)
+	}
+
 	ok = true
 	lcc := make(map[string]*listenerConfigCheck)
 	cdMode := cdUID != ""
@@ -1284,6 +1806,15 @@ func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, noti
 			_ = closer.Close()
 		}
 	}()
+	// bindAttempts feeds the provisioning result detail. newProvisionResult
+	// caps it, so it grows freely here.
+	var bindAttempts []provisionBindAttempt
+	recordBindAttempt := func(addr, proto string, err error) {
+		if err != nil {
+			bindAttempts = append(bindAttempts, provisionBindAttempt{Addr: addr, Proto: proto, OSError: err.Error()})
+		}
+	}
+
 	// tryListen attempts to listen on given udp and tcp address.
 	// Created listeners will be kept in listeners slice above, and close
 	// before function finished.
@@ -1292,16 +1823,21 @@ func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, noti
 		if udpLn != nil {
 			closers = append(closers, udpLn)
 		}
+		recordBindAttempt(addr, "udp", udpErr)
 		tcpLn, tcpErr := net.Listen("tcp", addr)
 		if tcpLn != nil {
 			closers = append(closers, tcpLn)
 		}
+		recordBindAttempt(addr, "tcp", tcpErr)
 		return errors.Join(udpErr, tcpErr)
 	}
 
+	listenerMsg := func(listenerNum int, format string, v ...any) string {
+		return fmt.Sprintf("listener.%d %s", listenerNum, fmt.Sprintf(format, v...))
+	}
 	logMsg := func(e *zerolog.Event, listenerNum int, format string, v ...any) {
 		e.MsgFunc(func() string {
-			return fmt.Sprintf("listener.%d %s", listenerNum, fmt.Sprintf(format, v...))
+			return listenerMsg(listenerNum, format, v...)
 		})
 	}
 
@@ -1353,8 +1889,10 @@ func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, noti
 		maxAttempts := 10
 		for {
 			if attempts == maxAttempts {
-				notifyFunc()
-				logMsg(mainLog.Load().Fatal(), n, "could not find available listen ip and port")
+				logMsg(mainLog.Load().Error(), n, "could not find available listen ip and port")
+				msg := listenerMsg(n, "could not find available listen ip and port")
+				failProvision(newProvisionResult(provisionCodeListenerBindFailed, msg, bindAttempts, provisionSecrets()...), notifyFunc)
+				return updated, false
 			}
 			addr := net.JoinHostPort(listener.IP, strconv.Itoa(listener.Port))
 			err := tryListen(addr)
@@ -1366,8 +1904,10 @@ func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, noti
 
 			if !check.IP && !check.Port {
 				if fatal {
-					notifyFunc()
-					logMsg(mainLog.Load().Fatal(), n, "failed to listen: %v", err)
+					logMsg(mainLog.Load().Error(), n, "failed to listen: %v", err)
+					msg := listenerMsg(n, "failed to listen: %v", err)
+					failProvision(newProvisionResult(provisionCodeListenerAddrUnavail, msg, bindAttempts, provisionSecrets()...), notifyFunc)
+					return updated, false
 				}
 				ok = false
 				break
@@ -1434,8 +1974,11 @@ func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, noti
 			}
 			if listener.IP == oldIP && listener.Port == oldPort {
 				if fatal {
-					notifyFunc()
-					logMsg(mainLog.Load().Fatal(), n, "could not listen on %s: %v", net.JoinHostPort(listener.IP, strconv.Itoa(listener.Port)), err)
+					triedAddr := net.JoinHostPort(listener.IP, strconv.Itoa(listener.Port))
+					logMsg(mainLog.Load().Error(), n, "could not listen on %s: %v", triedAddr, err)
+					msg := listenerMsg(n, "could not listen on %s: %v", triedAddr, err)
+					failProvision(newProvisionResult(provisionCodeListenerBindFailed, msg, bindAttempts, provisionSecrets()...), notifyFunc)
+					return updated, false
 				}
 				ok = false
 				break
@@ -1473,8 +2016,10 @@ func tryUpdateListenerConfig(cfg *ctrld.Config, infoLogger *zerolog.Logger, noti
 					}
 				}
 				if !found {
-					notifyFunc()
-					logMsg(mainLog.Load().Fatal(), n, "could not use %q as DNS nameserver with systemd resolved", listener.IP)
+					logMsg(mainLog.Load().Error(), n, "could not use %q as DNS nameserver with systemd resolved", listener.IP)
+					msg := listenerMsg(n, "could not use %q as DNS nameserver with systemd resolved", listener.IP)
+					failProvision(newProvisionResult(provisionCodeListenerAddrUnavail, msg, bindAttempts, provisionSecrets()...), notifyFunc)
+					return updated, false
 				}
 			}
 		}
@@ -1501,6 +2046,84 @@ func osVersion() string {
 	return oi.String()
 }
 
+// provisionTokenMinLen, provisionTokenMaxLen, and provisionTokenExpectedPrefix
+// describe the shape of a --cd-org value the input stage checks before any
+// network call.
+const (
+	provisionTokenMinLen         = 6
+	provisionTokenMaxLen         = 64
+	provisionTokenExpectedPrefix = "org-v1-"
+)
+
+// provisionTokenShapeValid reports whether token looks like something the API
+// could parse: a length between provisionTokenMinLen and provisionTokenMaxLen,
+// with no whitespace or control characters. It does not require the
+// "org-v1-" prefix - legacy provisioning codes predate that convention and
+// are handled with a warning, not a failure.
+func provisionTokenShapeValid(token string) bool {
+	if len(token) < provisionTokenMinLen || len(token) > provisionTokenMaxLen {
+		return false
+	}
+	for _, r := range token {
+		if unicode.IsSpace(r) || unicode.IsControl(r) {
+			return false
+		}
+	}
+	return true
+}
+
+// validateProvisionTokenShape classifies an obviously malformed --cd-org
+// value (PROVISION_TOKEN_MALFORMED) before any network call, so a typo or a
+// pasted URL fails fast instead of going through a doomed API round trip. A
+// token missing the "org-v1-" prefix only gets a logged warning: legacy
+// provisioning codes may lack it and still work.
+func validateProvisionTokenShape() bool {
+	if !provisionTokenShapeValid(cdOrg) {
+		msg := fmt.Sprintf("--cd-org provisioning code is malformed: must be %d-%d characters with no whitespace or control characters", provisionTokenMinLen, provisionTokenMaxLen)
+		failProvision(newProvisionResult(provisionCodeProvisionTokenMalformed, msg, nil, provisionSecrets()...), nil)
+		return false
+	}
+	if !strings.HasPrefix(cdOrg, provisionTokenExpectedPrefix) {
+		mainLog.Load().Warn().Msg("--cd-org provisioning code does not have the expected org-v1- prefix; continuing, since legacy codes may lack it")
+	}
+	return true
+}
+
+// validateCustomHostnameFlag classifies an invalid --custom-hostname value
+// (CUSTOM_HOSTNAME_INVALID) before any network call. ctrld's accept/reject
+// rule (validHostname) is unchanged - this only names the field, the
+// offending character(s), and the allowed format instead of a bare fatal
+// exit. ControlD's device-name formatting folds or strips some characters
+// ctrld still accepts (dot, space, plus), so a hostname using one of those
+// gets a one-line notice instead: the registered device name may differ from
+// what was requested.
+func validateCustomHostnameFlag() bool {
+	if customHostname == "" {
+		return true
+	}
+	if !validHostname(customHostname) {
+		failProvision(newProvisionResult(provisionCodeCustomHostnameInvalid, customHostnameFailureMessage(customHostname), nil, provisionSecrets()...), nil)
+		return false
+	}
+	if hostnameMayBeFoldedByServer(customHostname) {
+		mainLog.Load().Notice().Msgf("device name %q contains characters ControlD may fold or strip when it registers the device; the registered name may differ", customHostname)
+	}
+	return true
+}
+
+// validateInterceptModeFlag classifies an invalid --intercept-mode value
+// (INTERCEPT_MODE_INVALID) on the provisioning boundary, so a typo fails with
+// a stable code instead of a bare fatal exit an installer wrapper cannot tell
+// apart from any other crash. An empty mode means the flag was not set.
+func validateInterceptModeFlag(mode string) bool {
+	if mode == "" || validInterceptMode(mode) {
+		return true
+	}
+	msg := fmt.Sprintf("--intercept-mode %q is not valid: must be 'off', 'dns', or 'hard'", mode)
+	failProvision(newProvisionResult(provisionCodeInterceptModeInvalid, msg, nil, provisionSecrets()...), nil)
+	return false
+}
+
 // cdUIDFromProvToken fetch UID from ControlD API using provision token.
 func cdUIDFromProvToken() string {
 	// --cd flag supersedes --cd-org, ignore it if both are supplied.
@@ -1511,18 +2134,35 @@ func cdUIDFromProvToken() string {
 	if cdOrg == "" {
 		return ""
 	}
-	// Validate custom hostname if provided.
-	if customHostname != "" && !validHostname(customHostname) {
-		mainLog.Load().Fatal().Msgf("invalid custom hostname: %q", customHostname)
+	if !validateProvisionTokenShape() {
+		return ""
 	}
-	req := &controld.UtilityOrgRequest{ProvToken: cdOrg, Hostname: customHostname}
+	if !validateCustomHostnameFlag() {
+		return ""
+	}
+
+	req := &controld.UtilityOrgRequest{
+		ProvToken: cdOrg,
+		Hostname:  customHostname,
+		Metadata:  ctrld.SystemMetadata(context.Background()),
+	}
 	// Process provision token if provided.
-	resolverConfig, err := controld.FetchResolverUID(req, rootCmd.Version, cdDev)
+	resolverConfig, err := fetchResolverUIDFn(context.Background(), req, rootCmd.Version, cdDev)
 	if err != nil {
-		mainLog.Load().Fatal().Err(err).Msgf("failed to fetch resolver uid with provision token: %s", cdOrg)
+		// The token exchange is the first API call of an org/MDM install, so
+		// its failure must carry a code like every other bootstrap failure.
+		code, _ := apiFailureCode(err)
+		mainLog.Load().Error().Msgf("failed to fetch resolver uid with provision token: %s: %s",
+			redactToken(cdOrg), redactSecrets(err.Error(), provisionSecrets()...))
+		failProvision(newProvisionResult(code, provisionTokenFailureMessage(code, err), nil, provisionSecrets()...), nil)
+		return ""
 	}
 	return resolverConfig.UID
 }
+
+// fetchResolverUIDFn is a var so tests can drive token-exchange failures
+// without reaching the network.
+var fetchResolverUIDFn = controld.FetchResolverUID
 
 // removeOrgFlagsFromArgs removes organization flags from command line arguments.
 // The flags are:
@@ -1609,8 +2249,9 @@ func newSocketControlClientMobile(dir string, stopCh chan struct{}) *controlClie
 		case <-stopCh:
 			return nil
 		default:
-			_, err := cc.post("/", nil)
+			resp, err := cc.post("/", nil)
 			if err == nil {
+				resp.Body.Close()
 				return cc
 			} else {
 				bo.BackOff(ctx, err)
@@ -1620,32 +2261,55 @@ func newSocketControlClientMobile(dir string, stopCh chan struct{}) *controlClie
 }
 
 // checkStrFlagEmpty validates if a string flag was set to an empty string.
-// If yes, emitting a fatal error message.
-func checkStrFlagEmpty(cmd *cobra.Command, flagName string) {
+// An explicit empty --cd-org is a malformed provisioning token, classified on
+// the provisioning boundary; every other flag keeps the bare fatal, since
+// this helper is shared with flags outside that boundary. Returns false when
+// the caller must stop: provisionExit is stubbed out under test, so nothing
+// else stops execution from falling through.
+func checkStrFlagEmpty(cmd *cobra.Command, flagName string) bool {
 	fl := cmd.Flags().Lookup(flagName)
-	if !fl.Changed || fl.Value.Type() != "string" {
-		return
+	if !fl.Changed || fl.Value.Type() != "string" || fl.Value.String() != "" {
+		return true
 	}
-	if fl.Value.String() == "" {
-		mainLog.Load().Fatal().Msgf(`flag "--%s" value must be non-empty`, fl.Name)
+	if flagName == cdOrgFlagName {
+		msg := fmt.Sprintf("--%s provisioning code is malformed: value must be non-empty", cdOrgFlagName)
+		failProvision(newProvisionResult(provisionCodeProvisionTokenMalformed, msg, nil, provisionSecrets()...), nil)
+		return false
 	}
+	mainLog.Load().Fatal().Msgf(`flag "--%s" value must be non-empty`, fl.Name)
+	return false
 }
 
-func validateCdUpstreamProtocol() {
+// validateCdUpstreamProtocol validates the Control D upstream protocol,
+// classified on the provisioning boundary since it only runs once --cd is
+// set. notify unblocks a waiting "ctrld start" on the daemon side; the parent
+// process, which has no one waiting, passes nil. Returns false when the
+// caller must stop.
+func validateCdUpstreamProtocol(notify func()) bool {
 	if cdUID == "" {
-		return
+		return true
 	}
 	switch cdUpstreamProto {
 	case ctrld.ResolverTypeDOH, ctrld.ResolverTypeDOH3:
+		return true
 	default:
-		mainLog.Load().Fatal().Msg(`flag "--protocol" must be "doh" or "doh3"`)
+		msg := fmt.Sprintf("--proto %q is not valid: must be 'doh' or 'doh3'", cdUpstreamProto)
+		failProvision(newProvisionResult(provisionCodeInvalidFlagCombination, msg, nil, provisionSecrets()...), notify)
+		return false
 	}
 }
 
-func validateCdAndNextDNSFlags() {
+// validateCdAndNextDNSFlags validates that Control D and NextDNS flags are
+// not used together, classified on the provisioning boundary since it only
+// fires once --cd or --cd-org is set. Returns false when the caller must
+// stop.
+func validateCdAndNextDNSFlags() bool {
 	if (cdUID != "" || cdOrg != "") && nextdns != "" {
-		mainLog.Load().Fatal().Msgf("--%s/--%s could not be used with --%s", cdUidFlagName, cdOrgFlagName, nextdnsFlagName)
+		msg := fmt.Sprintf("--%s/--%s cannot be used together with --%s", cdUidFlagName, cdOrgFlagName, nextdnsFlagName)
+		failProvision(newProvisionResult(provisionCodeInvalidFlagCombination, msg, nil, provisionSecrets()...), nil)
+		return false
 	}
+	return true
 }
 
 // removeNextDNSFromArgs removes the --nextdns from command line arguments.
@@ -1698,6 +2362,9 @@ var errInvalidDeactivationPin = errors.New("deactivation pin is invalid")
 // errRequiredDeactivationPin indicates that the deactivation pin is required but not provided by users.
 var errRequiredDeactivationPin = errors.New("deactivation pin is required to stop or uninstall the service")
 
+// errTooManyDeactivationPin represents an error indicating excessive deactivation PIN request attempts.
+var errTooManyDeactivationPin = errors.New("too many request attempts")
+
 // checkDeactivationPin validates if the deactivation pin matches one in ControlD config.
 func checkDeactivationPin(s service.Service, stopCh chan struct{}) error {
 	mainLog.Load().Debug().Msg("Checking deactivation pin")
@@ -1722,10 +2389,14 @@ func checkDeactivationPin(s service.Service, stopCh chan struct{}) error {
 	resp, err := cc.post(deactivationPath, bytes.NewReader(data))
 	mainLog.Load().Debug().Msg("Posting deactivation request done")
 	if resp != nil {
+		defer resp.Body.Close()
 		switch resp.StatusCode {
 		case http.StatusBadRequest:
 			mainLog.Load().Error().Msg(errRequiredDeactivationPin.Error())
 			return errRequiredDeactivationPin // pin is required
+		case http.StatusTooManyRequests:
+			mainLog.Load().Error().Msg(errTooManyDeactivationPin.Error())
+			return errTooManyDeactivationPin
 		case http.StatusOK:
 			return nil // valid pin
 		case http.StatusNotFound:
@@ -1738,7 +2409,9 @@ func checkDeactivationPin(s service.Service, stopCh chan struct{}) error {
 
 // isCheckDeactivationPinErr reports whether there is an error during check deactivation pin process.
 func isCheckDeactivationPinErr(err error) bool {
-	return errors.Is(err, errInvalidDeactivationPin) || errors.Is(err, errRequiredDeactivationPin)
+	return errors.Is(err, errInvalidDeactivationPin) ||
+		errors.Is(err, errRequiredDeactivationPin) ||
+		errors.Is(err, errTooManyDeactivationPin)
 }
 
 // ensureUninstall ensures that s.Uninstall will remove ctrld service from system completely.
@@ -1854,18 +2527,43 @@ func runningIface(s service.Service) *ifaceResponse {
 	return nil
 }
 
+// apiRejectionMessage returns the result-file message for a permanent API
+// rejection: the HTTP status for a device-invalid or generic rejection, or
+// the raw error for anything else (network trouble, an unreachable API).
+func apiRejectionMessage(err error) string {
+	var uer *controld.ErrorResponse
+	if errors.As(err, &uer) && uer.ErrorField.Code == controld.InvalidConfigCode {
+		return apiRejectionSummary(uer.StatusCode)
+	}
+	if rejection, ok := permanentAPIRejection(err); ok {
+		return apiRejectionSummary(rejection.StatusCode)
+	}
+	return fmt.Sprintf("failed to fetch resolver config: %v", err)
+}
+
 // doValidateCdRemoteConfig fetches and validates custom config for cdUID.
+// fatal distinguishes the two callers: a direct install-time caller passes
+// true and classifies a fetch failure on the provisioning boundary; the
+// restart path passes false and gets the error back to decide for itself,
+// with no process exit.
 func doValidateCdRemoteConfig(cdUID string, fatal bool) error {
-	rc, err := controld.FetchResolverConfig(cdUID, rootCmd.Version, cdDev)
+	// Username is only sent during initial provisioning (cdUIDFromProvToken).
+	// All subsequent calls use lightweight metadata to avoid EDR triggers.
+	req := &controld.ResolverConfigRequest{
+		RawUID:   cdUID,
+		Version:  rootCmd.Version,
+		Metadata: ctrld.SystemMetadataRuntime(context.Background()),
+	}
+	rc, err := fetchResolverConfig(context.Background(), req, cdDev)
 	if err != nil {
-		logger := mainLog.Load().Fatal()
 		if !fatal {
-			logger = mainLog.Load().Warn()
-		}
-		logger.Err(err).Err(err).Msgf("failed to fetch resolver uid: %s", cdUID)
-		if !fatal {
+			mainLog.Load().Warn().Err(err).Msgf("failed to fetch resolver config for %s", redactToken(cdUID))
 			return err
 		}
+		code, _ := apiFailureCode(err)
+		mainLog.Load().Error().Err(err).Msgf("failed to fetch resolver config for %s", redactToken(cdUID))
+		failProvision(newProvisionResult(code, apiRejectionMessage(err), nil, provisionSecrets()...), nil)
+		return err
 	}
 
 	// return earlier if there's no custom config.
@@ -1884,17 +2582,25 @@ func doValidateCdRemoteConfig(cdUID string, fatal bool) error {
 	} else {
 		if errors.As(cfgErr, &viper.ConfigParseError{}) {
 			if configStr, _ := base64.StdEncoding.DecodeString(rc.Ctrld.CustomConfig); len(configStr) > 0 {
-				tmpDir := os.TempDir()
-				tmpConfFile := filepath.Join(tmpDir, "ctrld.toml")
 				errorLogged := false
-				// Write remote config to a temporary file to get details error.
-				if we := os.WriteFile(tmpConfFile, configStr, 0600); we == nil {
+				// Write remote config to a uniquely named temporary file to get detailed error.
+				if tmpFile, tmpErr := os.CreateTemp("", "ctrld-*.toml"); tmpErr == nil {
+					tmpConfFile := tmpFile.Name()
+					if _, err := tmpFile.Write(configStr); err != nil {
+						mainLog.Load().Error().Err(err).Msg("failed to write temporary config file")
+					}
+					if err := tmpFile.Close(); err != nil {
+						mainLog.Load().Error().Err(err).Msg("failed to save temporary config file")
+
+					}
 					if de := decoderErrorFromTomlFile(tmpConfFile); de != nil {
 						row, col := de.Position()
 						mainLog.Load().Error().Msgf("failed to parse custom config at line: %d, column: %d, error: %s", row, col, de.Error())
 						errorLogged = true
 					}
-					_ = os.Remove(tmpConfFile)
+					if err := os.Remove(tmpConfFile); err != nil {
+						mainLog.Load().Error().Err(err).Msg("failed to remove temporary config file")
+					}
 				}
 				// If we could not log details error, emit what we have already got.
 				if !errorLogged {
@@ -1912,6 +2618,23 @@ func doValidateCdRemoteConfig(cdUID string, fatal bool) error {
 	return nil
 }
 
+// ensureRunningIfaceForInvalidUninstall populates p.runningIface before the
+// invalid-device self-uninstall resets DNS. This path can run early during
+// service startup (e.g. right after a reboot) before the running interface is
+// otherwise known. resetDNS, via resetDNSForRunningIface, silently skips DNS
+// restoration when p.runningIface is empty, which would leave the OS pointed at
+// ctrld's local listener after the service is removed. See issue-556.
+func ensureRunningIfaceForInvalidUninstall(p *prog, s service.Service) {
+	if iface == "" {
+		iface = autoIface
+	}
+	p.preRun()
+	if ir := runningIface(s); ir != nil {
+		p.runningIface = ir.Name
+		p.requiredMultiNICsConfig = ir.All
+	}
+}
+
 // uninstallInvalidCdUID performs self-uninstallation because the ControlD device does not exist.
 func uninstallInvalidCdUID(p *prog, logger zerolog.Logger, doStop bool) bool {
 	s, err := newService(p, svcConfig)
@@ -1919,8 +2642,13 @@ func uninstallInvalidCdUID(p *prog, logger zerolog.Logger, doStop bool) bool {
 		logger.Warn().Err(err).Msg("failed to create new service")
 		return false
 	}
+	ensureRunningIfaceForInvalidUninstall(p, s)
 	// restore static DNS settings or DHCP
 	p.resetDNS(false, true)
+	// The invalid-device path may run early during service startup before runningIface
+	// is known. Restore every saved static DNS file so uninstalling does not leave the
+	// OS pointed at ctrld's local listener after the service is removed.
+	restoreSavedStaticDNS("", true)
 
 	tasks := []task{{s.Uninstall, true, "Uninstall"}}
 	if doTasks(tasks) {
@@ -1931,4 +2659,13 @@ func uninstallInvalidCdUID(p *prog, logger zerolog.Logger, doStop bool) bool {
 		return true
 	}
 	return false
+}
+
+// redactToken returns the first 4 characters of a token followed by ***,
+// or just *** if the token is 4 characters or shorter.
+func redactToken(s string) string {
+	if len(s) <= 4 {
+		return "***"
+	}
+	return s[:4] + "***"
 }

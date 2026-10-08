@@ -4,13 +4,21 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
+	"errors"
 	"net"
+	"os"
+	"runtime"
+	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/miekg/dns"
+	"github.com/rs/zerolog"
 )
 
 func Test_osResolver_Resolve(t *testing.T) {
@@ -70,6 +78,270 @@ func Test_osResolver_ResolveLanHostname(t *testing.T) {
 	}
 }
 
+func Test_customDNSExchangeWith_RetriesUnboundOnUnreachableSource(t *testing.T) {
+	tests := []struct {
+		name    string
+		boundIP net.IP
+		server  string
+		errno   syscall.Errno
+	}{
+		{"ipv4 network unreachable", net.ParseIP("192.0.2.10"), "192.0.2.53:53", syscall.ENETUNREACH},
+		{"ipv4 host unreachable", net.ParseIP("192.0.2.10"), "192.0.2.53:53", syscall.EHOSTUNREACH},
+		{"ipv6 network unreachable", net.ParseIP("2001:db8::10"), "[2001:db8::53]:53", syscall.ENETUNREACH},
+		{"ipv6 host unreachable", net.ParseIP("2001:db8::10"), "[2001:db8::53]:53", syscall.EHOSTUNREACH},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			msg := new(dns.Msg)
+			msg.SetQuestion("internal.example.", dns.TypeA)
+			var localIPs []net.IP
+			var servers []string
+			exchange := func(_ context.Context, msg *dns.Msg, server string, localIP net.IP) (*dns.Msg, time.Duration, error) {
+				localIPs = append(localIPs, append(net.IP(nil), localIP...))
+				servers = append(servers, server)
+				if localIP != nil {
+					return nil, 0, &net.OpError{Op: "write", Net: "udp", Err: &os.SyscallError{Syscall: "write", Err: tt.errno}}
+				}
+				answer := new(dns.Msg)
+				answer.SetReply(msg)
+				return answer, time.Millisecond, nil
+			}
+
+			answer, _, err := customDNSExchangeWith(context.Background(), msg, tt.server, tt.boundIP, true, exchange)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if answer == nil {
+				t.Fatal("expected answer from route-selected retry")
+			}
+			if len(localIPs) != 2 {
+				t.Fatalf("exchange calls: got %d, want 2", len(localIPs))
+			}
+			if !localIPs[0].Equal(tt.boundIP) {
+				t.Fatalf("first source: got %v, want %v", localIPs[0], tt.boundIP)
+			}
+			if localIPs[1] != nil {
+				t.Fatalf("retry source: got %v, want route-selected nil", localIPs[1])
+			}
+			if len(servers) != 2 || servers[0] != tt.server || servers[1] != tt.server {
+				t.Fatalf("exchange servers: got %v, want two attempts to %s", servers, tt.server)
+			}
+		})
+	}
+}
+
+func Test_customDNSExchangeWith_PreservesReachableBoundSource(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	boundIP := net.ParseIP("192.0.2.10")
+	calls := 0
+	exchange := func(_ context.Context, msg *dns.Msg, _ string, localIP net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		if !localIP.Equal(boundIP) {
+			t.Fatalf("source: got %v, want %v", localIP, boundIP)
+		}
+		answer := new(dns.Msg)
+		answer.SetReply(msg)
+		return answer, time.Millisecond, nil
+	}
+
+	answer, _, err := customDNSExchangeWith(context.Background(), msg, "192.0.2.53:53", boundIP, true, exchange)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer == nil {
+		t.Fatal("expected answer from bound exchange")
+	}
+	if calls != 1 {
+		t.Fatalf("exchange calls: got %d, want 1", calls)
+	}
+}
+
+func Test_customDNSExchangeWith_DoesNotRetryOtherFailures(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	calls := 0
+	exchange := func(_ context.Context, _ *dns.Msg, _ string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		return nil, 0, context.DeadlineExceeded
+	}
+
+	_, _, err := customDNSExchangeWith(context.Background(), msg, "192.0.2.53:53", net.ParseIP("192.0.2.10"), true, exchange)
+	if err == nil {
+		t.Fatal("expected exchange failure")
+	}
+	if calls != 1 {
+		t.Fatalf("exchange calls: got %d, want 1", calls)
+	}
+}
+
+func Test_customDNSExchangeWith_DoesNotRetryWithoutBoundSource(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	calls := 0
+	exchange := func(_ context.Context, _ *dns.Msg, _ string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		return nil, 0, &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
+	}
+
+	_, _, err := customDNSExchangeWith(context.Background(), msg, "192.0.2.53:53", nil, true, exchange)
+	if err == nil {
+		t.Fatal("expected exchange failure")
+	}
+	if calls != 1 {
+		t.Fatalf("exchange calls: got %d, want 1", calls)
+	}
+}
+
+func Test_customDNSExchangeWith_DoesNotRetryCanceledContext(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	calls := 0
+	exchange := func(_ context.Context, _ *dns.Msg, _ string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		return nil, 0, &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
+	}
+
+	_, _, err := customDNSExchangeWith(ctx, msg, "192.0.2.53:53", net.ParseIP("192.0.2.10"), true, exchange)
+	if err == nil {
+		t.Fatal("expected exchange failure")
+	}
+	if calls != 1 {
+		t.Fatalf("exchange calls: got %d, want 1", calls)
+	}
+}
+
+func Test_customDNSExchangeWith_ReturnsUnboundRetryFailure(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	retryErr := errors.New("route-selected exchange failed")
+	calls := 0
+	exchange := func(_ context.Context, _ *dns.Msg, _ string, localIP net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		if localIP != nil {
+			return nil, 0, &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
+		}
+		return nil, 0, retryErr
+	}
+
+	_, _, err := customDNSExchangeWith(context.Background(), msg, "192.0.2.53:53", net.ParseIP("192.0.2.10"), true, exchange)
+	if !errors.Is(err, retryErr) {
+		t.Fatalf("exchange error: got %v, want retry error %v", err, retryErr)
+	}
+	if calls != 2 {
+		t.Fatalf("exchange calls: got %d, want 2", calls)
+	}
+}
+
+func Test_customDNSExchangeWith_DoesNotRetryReadSideUnreachable(t *testing.T) {
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	calls := 0
+	exchange := func(_ context.Context, _ *dns.Msg, _ string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		return nil, 0, &net.OpError{Op: "read", Net: "udp", Err: syscall.EHOSTUNREACH}
+	}
+
+	_, _, err := customDNSExchangeWith(context.Background(), msg, "192.0.2.53:53", net.ParseIP("192.0.2.10"), true, exchange)
+	if err == nil {
+		t.Fatal("expected exchange failure")
+	}
+	if calls != 1 {
+		t.Fatalf("exchange calls: got %d, want 1", calls)
+	}
+}
+
+func Test_osResolver_ResolveUsesRouteSelectedFallbackForLANServer(t *testing.T) {
+	const server = "10.0.0.53:53"
+	boundIP := net.ParseIP("192.0.2.10")
+	resolver := newResolverWithNameserver([]string{server})
+	resolver.localIP = func(string) net.IP { return boundIP }
+
+	var localIPs []net.IP
+	var servers []string
+	resolver.exchangeDNS = func(_ context.Context, msg *dns.Msg, gotServer string, localIP net.IP) (*dns.Msg, time.Duration, error) {
+		servers = append(servers, gotServer)
+		localIPs = append(localIPs, append(net.IP(nil), localIP...))
+		if localIP != nil {
+			return nil, 0, &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
+		}
+		answer := new(dns.Msg)
+		answer.SetReply(msg)
+		return answer, time.Millisecond, nil
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	answer, err := resolver.Resolve(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer == nil {
+		t.Fatal("expected answer from route-selected retry")
+	}
+	if len(localIPs) != 2 || !localIPs[0].Equal(boundIP) || localIPs[1] != nil {
+		t.Fatalf("exchange sources: got %v, want [%v <nil>]", localIPs, boundIP)
+	}
+	if len(servers) != 2 || servers[0] != server || servers[1] != server {
+		t.Fatalf("exchange servers: got %v, want two attempts to %s", servers, server)
+	}
+}
+
+// A VPN-pushed public DNS address is categorized as public by IP, but it is
+// still a system-selected resolver and must get the same route-compatible retry.
+func Test_osResolver_ResolveUsesRouteSelectedFallbackForPublicVPNServer(t *testing.T) {
+	const server = "192.0.2.53:53"
+	boundIP := net.ParseIP("198.51.100.10")
+	resolver := newResolverWithNameserver([]string{server})
+	resolver.localIP = func(string) net.IP { return boundIP }
+
+	var localIPs []net.IP
+	resolver.exchangeDNS = func(_ context.Context, msg *dns.Msg, _ string, localIP net.IP) (*dns.Msg, time.Duration, error) {
+		localIPs = append(localIPs, append(net.IP(nil), localIP...))
+		if localIP != nil {
+			return nil, 0, &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
+		}
+		answer := new(dns.Msg)
+		answer.SetReply(msg)
+		return answer, time.Millisecond, nil
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	answer, err := resolver.Resolve(context.Background(), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer == nil {
+		t.Fatal("expected answer from route-selected retry")
+	}
+	if len(localIPs) != 2 || !localIPs[0].Equal(boundIP) || localIPs[1] != nil {
+		t.Fatalf("exchange sources: got %v, want [%v <nil>]", localIPs, boundIP)
+	}
+}
+
+func Test_osResolver_ResolveDoesNotRetrySyntheticControlDFallbackUnbound(t *testing.T) {
+	resolver := newResolverWithNameserver([]string{controldPublicDnsWithPort})
+	resolver.localIP = func(string) net.IP { return net.ParseIP("198.51.100.10") }
+	calls := 0
+	resolver.exchangeDNS = func(_ context.Context, _ *dns.Msg, _ string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		return nil, 0, &net.OpError{Op: "write", Net: "udp", Err: syscall.EHOSTUNREACH}
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("internal.example.", dns.TypeA)
+	_, err := resolver.Resolve(context.Background(), msg)
+	if err == nil {
+		t.Fatal("expected exchange failure")
+	}
+	if calls != 1 {
+		t.Fatalf("exchange calls: got %d, want one bound synthetic fallback attempt", calls)
+	}
+}
+
 func Test_osResolver_ResolveWithNonSuccessAnswer(t *testing.T) {
 	// Set up a LAN nameserver that returns a success response.
 	lanPC, err := net.ListenPacket("udp", "127.0.0.1:0") // 127.0.0.1 is considered LAN (loopback)
@@ -122,6 +394,31 @@ func Test_osResolver_ResolveWithNonSuccessAnswer(t *testing.T) {
 	// Since a LAN nameserver is available and returns a success answer, we expect RcodeSuccess.
 	if answer.Rcode != dns.RcodeSuccess {
 		t.Errorf("expected a success answer from LAN nameserver (RcodeSuccess) but got: %s", dns.RcodeToString[answer.Rcode])
+	}
+}
+
+func TestOSResolverNameserverSetsKeepsSyntheticFallbackOutOfSystemDiscovery(t *testing.T) {
+	system := []string{"fe80::1"}
+	effective, discovered, skip := osResolverNameserverSets(system, false)
+	if skip {
+		t.Fatal("non-empty discovery unexpectedly skipped resolver replacement")
+	}
+
+	if len(discovered) != 1 || discovered[0] != system[0] {
+		t.Fatalf("discovered nameservers = %v, want raw system list %v", discovered, system)
+	}
+	if len(effective) != 2 || effective[0] != "[fe80::1]:53" || effective[1] != controldPublicDnsWithPort {
+		t.Fatalf("effective nameservers = %v, want IPv6 system resolver plus synthetic fallback", effective)
+	}
+}
+
+func TestOSResolverNameserverSetsHonorsEmptyGuard(t *testing.T) {
+	effective, discovered, skip := osResolverNameserverSets(nil, true)
+	if len(effective) != 0 || len(discovered) != 0 {
+		t.Fatalf("guarded empty discovery returned effective=%v discovered=%v", effective, discovered)
+	}
+	if !skip {
+		t.Fatal("guarded empty discovery did not return the skip decision")
 	}
 }
 
@@ -282,6 +579,93 @@ func Test_Edns0_CacheReply(t *testing.T) {
 	}
 }
 
+// ecsAnswerHandler returns a distinct A record per EDNS Client Subnet, so a test can
+// prove one subnet never receives another subnet's cached record. It counts upstream
+// calls to confirm the hot cache/singleflight is partitioned by ECS rather than shared.
+func ecsAnswerHandler(call *atomic.Int64) dns.HandlerFunc {
+	return func(w dns.ResponseWriter, msg *dns.Msg) {
+		call.Add(1)
+		a := "203.0.113.1" // no/other subnet
+		if opt := msg.IsEdns0(); opt != nil {
+			for _, o := range opt.Option {
+				if e, ok := o.(*dns.EDNS0_SUBNET); ok {
+					switch {
+					case e.Address.Equal(net.ParseIP("2001:db8:1::")):
+						a = "192.0.2.1"
+					case e.Address.Equal(net.ParseIP("2001:db8:2::")):
+						a = "198.51.100.1"
+					}
+				}
+			}
+		}
+		m := new(dns.Msg)
+		m.SetReply(msg)
+		rr, _ := dns.NewRR(msg.Question[0].Name + " 300 IN A " + a)
+		m.Answer = []dns.RR{rr}
+		w.WriteMsg(m)
+	}
+}
+
+// Test_osResolver_HotCache_ECSPartition is the real cache-path regression test for #564 on
+// the osResolver hot cache / singleflight path: the upstream returns a different A record
+// per subnet, and a client in subnet B must never be served subnet A's hot-cached record.
+func Test_osResolver_HotCache_ECSPartition(t *testing.T) {
+	lanPC, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen on LAN address: %v", err)
+	}
+	call := &atomic.Int64{}
+	lanServer, lanAddr, err := runLocalPacketConnTestServer(t, lanPC, ecsAnswerHandler(call))
+	if err != nil {
+		t.Fatalf("failed to run LAN test server: %v", err)
+	}
+	defer lanServer.Shutdown()
+
+	or := newResolverWithNameserver([]string{lanAddr})
+	query := func(subnet string) string {
+		m := new(dns.Msg)
+		m.SetQuestion(dns.Fqdn("controld.com"), dns.TypeA)
+		m.RecursionDesired = true
+		m.SetEdns0(4096, true)
+		m.IsEdns0().Option = append(m.IsEdns0().Option, &dns.EDNS0_SUBNET{
+			Code:          dns.EDNS0SUBNET,
+			Family:        2,
+			SourceNetmask: 64,
+			Address:       net.ParseIP(subnet),
+		})
+		answer, err := or.Resolve(context.Background(), m)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, rr := range answer.Answer {
+			if a, ok := rr.(*dns.A); ok {
+				return a.A.String()
+			}
+		}
+		return ""
+	}
+
+	// Subnet A populates the hot cache; a repeat hits it (upstream called once).
+	if got := query("2001:db8:1::"); got != "192.0.2.1" {
+		t.Fatalf("subnet A: got %q, want 192.0.2.1", got)
+	}
+	if got := query("2001:db8:1::"); got != "192.0.2.1" {
+		t.Fatalf("subnet A repeat: got %q, want 192.0.2.1", got)
+	}
+	if call.Load() != 1 {
+		t.Fatalf("subnet A repeat did not hit the hot cache: %d upstream calls", call.Load())
+	}
+
+	// Subnet B must get ITS OWN record, not subnet A's hot-cached one, and this
+	// requires a fresh upstream call (the cache is partitioned, not shared).
+	if got := query("2001:db8:2::"); got != "198.51.100.1" {
+		t.Fatalf("subnet B was served the wrong record %q (want 198.51.100.1); hot cache is not ECS-partitioned", got)
+	}
+	if call.Load() != 2 {
+		t.Fatalf("subnet B unexpectedly served from subnet A's cache: %d upstream calls, want 2", call.Load())
+	}
+}
+
 // https://github.com/Control-D-Inc/ctrld/issues/255
 func Test_legacyResolverWithBigExtraSection(t *testing.T) {
 	lanPC, err := net.ListenPacket("udp", "127.0.0.1:0") // 127.0.0.1 is considered LAN (loopback)
@@ -383,6 +767,11 @@ func nonSuccessHandlerWithRcode(rcode int) dns.HandlerFunc {
 
 func countHandler(call *atomic.Int64) dns.HandlerFunc {
 	return func(w dns.ResponseWriter, msg *dns.Msg) {
+		// Count the call before writing the reply. The client returns as soon
+		// as it receives the response, so a caller that reads this counter right
+		// after Resolve returns would race an increment done after WriteMsg and
+		// could observe a stale zero.
+		call.Add(1)
 		m := new(dns.Msg)
 		m.SetRcode(msg, dns.RcodeSuccess)
 		if cookie := getEdns0Cookie(msg.IsEdns0()); cookie != nil {
@@ -395,7 +784,6 @@ func countHandler(call *atomic.Int64) dns.HandlerFunc {
 			m.IsEdns0().Option = append(m.IsEdns0().Option, cookieOption)
 		}
 		w.WriteMsg(m)
-		call.Add(1)
 	}
 }
 
@@ -475,4 +863,306 @@ func generateEdns0ServerCookie(clientCookie string) string {
 		panic(err)
 	}
 	return clientCookie + hex.EncodeToString(cookie)
+}
+
+// syncLogBuffer collects the log lines that any goroutine writes.
+type syncLogBuffer struct {
+	mu sync.Mutex
+	sb strings.Builder
+}
+
+func (b *syncLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.Write(p)
+}
+
+func (b *syncLogBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sb.String()
+}
+
+// captureProxyLog sends the proxy log to a buffer at debug level. It puts the
+// logger and the global level back when the test ends.
+func captureProxyLog(t *testing.T) *syncLogBuffer {
+	t.Helper()
+	buf := &syncLogBuffer{}
+	logger := zerolog.New(buf).Level(zerolog.DebugLevel)
+	previousLogger := ProxyLogger.Load()
+	previousLevel := zerolog.GlobalLevel()
+	ProxyLogger.Store(&logger)
+	zerolog.SetGlobalLevel(zerolog.DebugLevel)
+	t.Cleanup(func() {
+		ProxyLogger.Store(previousLogger)
+		zerolog.SetGlobalLevel(previousLevel)
+	})
+	return buf
+}
+
+// logEventsWithPrefix returns the log events whose message starts with prefix.
+func logEventsWithPrefix(t *testing.T, logs, prefix string) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	for _, line := range strings.Split(logs, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		event := map[string]any{}
+		if err := json.Unmarshal([]byte(line), &event); err != nil {
+			t.Fatalf("log line is not JSON: %q: %v", line, err)
+		}
+		message, _ := event["message"].(string)
+		if !strings.HasPrefix(message, prefix) {
+			continue
+		}
+		events = append(events, event)
+	}
+	return events
+}
+
+// wantLogField fails the test when an event misses a field or holds another value.
+func wantLogField(t *testing.T, event map[string]any, field string, want any) {
+	t.Helper()
+	got, ok := event[field]
+	if !ok {
+		t.Fatalf("log event has no field %q: %v", field, event)
+	}
+	if got != want {
+		t.Fatalf("log event field %q = %v, want %v", field, got, want)
+	}
+}
+
+// wantLogStrings fails the test when a list field does not hold want.
+func wantLogStrings(t *testing.T, event map[string]any, field string, want []string) {
+	t.Helper()
+	values, ok := event[field].([]any)
+	if !ok {
+		t.Fatalf("log event field %q is not a list: %v", field, event[field])
+	}
+	got := make([]string, 0, len(values))
+	for _, value := range values {
+		text, ok := value.(string)
+		if !ok {
+			t.Fatalf("log event field %q holds a value that is not a string: %v", field, value)
+		}
+		got = append(got, text)
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("log event field %q = %v, want %v", field, got, want)
+	}
+}
+
+// stubNameservers answers each system nameserver read from lists, in order.
+// The last list answers every read after it.
+func stubNameservers(t *testing.T, lists ...[]string) {
+	t.Helper()
+	previous := NameserversFn
+	reads := 0
+	NameserversFn = func() []string {
+		list := lists[min(reads, len(lists)-1)]
+		reads++
+		return slices.Clone(list)
+	}
+	t.Cleanup(func() { NameserversFn = previous })
+}
+
+// resetOsResolverLog clears the change-only state, so one test does not see
+// the nameserver reads of another.
+func resetOsResolverLog(t *testing.T) {
+	t.Helper()
+	reset := func() {
+		osResolverLog.mu.Lock()
+		defer osResolverLog.mu.Unlock()
+		osResolverLog.system = nameserverReads{}
+		osResolverLog.final = nameserverReads{}
+		osResolverLog.reason = osResolverReasonUnspecified
+	}
+	reset()
+	t.Cleanup(reset)
+}
+
+// keepOsResolver puts back the OS resolver that the process had before the test.
+func keepOsResolver(t *testing.T) {
+	t.Helper()
+	resolverMutex.Lock()
+	previous := or
+	resolverMutex.Unlock()
+	t.Cleanup(func() {
+		resolverMutex.Lock()
+		storeOsResolver(previous)
+		resolverMutex.Unlock()
+	})
+}
+
+// TestOsResolverNameserversReadsWithoutTheResolverLock covers a log header
+// render during a resolver initialization. That initialization holds
+// resolverMutex across a scutil read of several seconds, and the header must
+// not wait for it.
+func TestOsResolverNameserversReadsWithoutTheResolverLock(t *testing.T) {
+	keepOsResolver(t)
+	resolverMutex.Lock()
+	storeOsResolver(newResolverWithNameserver([]string{"192.0.2.1:53"}))
+
+	read := make(chan []string, 1)
+	go func() { read <- OsResolverNameservers() }()
+
+	select {
+	case nameservers := <-read:
+		resolverMutex.Unlock()
+		if want := []string{"192.0.2.1:53"}; !slices.Equal(nameservers, want) {
+			t.Fatalf("nameservers = %v, want %v", nameservers, want)
+		}
+	case <-time.After(5 * time.Second):
+		resolverMutex.Unlock()
+		t.Fatal("OsResolverNameservers waited for resolverMutex")
+	}
+}
+
+func TestJournalMarksTheEventAndKeepsItsLevel(t *testing.T) {
+	logs := captureProxyLog(t)
+
+	Journal(ProxyLogger.Load().Info()).Msg("Journal test event")
+
+	events := logEventsWithPrefix(t, logs.String(), "Journal test event")
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1: %s", len(events), logs.String())
+	}
+	wantLogField(t, events[0], JournalField, true)
+	wantLogField(t, events[0], "level", "info")
+}
+
+func TestOsResolverNameserverReadsLogOnChange(t *testing.T) {
+	logs := captureProxyLog(t)
+	resetOsResolverLog(t)
+	keepOsResolver(t)
+	first := []string{"192.0.2.1", "192.0.2.2"}
+	second := []string{"192.0.2.3"}
+	stubNameservers(t, first, first, second)
+
+	for range 3 {
+		InitializeOsResolverWithReason(false, "transition")
+	}
+
+	systemReads := logEventsWithPrefix(t, logs.String(), "Got system nameservers")
+	if len(systemReads) != 2 {
+		t.Fatalf("got %d system nameserver lines, want 2: %s", len(systemReads), logs.String())
+	}
+	wantLogField(t, systemReads[0], "repeats", float64(0))
+	wantLogField(t, systemReads[1], "repeats", float64(1))
+	wantLogField(t, systemReads[1], "message", "Got system nameservers: [192.0.2.3]")
+
+	finalReads := logEventsWithPrefix(t, logs.String(), "Final available nameservers")
+	if len(finalReads) != 2 {
+		t.Fatalf("got %d final nameserver lines, want 2: %s", len(finalReads), logs.String())
+	}
+	wantLogField(t, finalReads[1], "repeats", float64(1))
+
+	changes := logEventsWithPrefix(t, logs.String(), "OS resolver set changed")
+	if len(changes) != 2 {
+		t.Fatalf("got %d resolver change events, want one for each changed list: %s", len(changes), logs.String())
+	}
+	last := changes[1]
+	wantLogStrings(t, last, "before", first)
+	wantLogStrings(t, last, "after", second)
+	wantLogField(t, last, JournalField, true)
+	wantLogField(t, last, "level", "info")
+	wantLogField(t, last, "reason", "transition")
+	if _, ok := last["default_route"]; !ok {
+		t.Fatalf("resolver change event has no default_route field: %v", last)
+	}
+	wantSource := map[string]string{"darwin": "scutil", "windows": "dhcp", "linux": "resolv.conf"}[runtime.GOOS]
+	if wantSource != "" {
+		wantLogField(t, last, "source", wantSource)
+	}
+}
+
+func TestInitializeOsResolverReportsTheUnspecifiedReason(t *testing.T) {
+	logs := captureProxyLog(t)
+	resetOsResolverLog(t)
+	keepOsResolver(t)
+	stubNameservers(t, []string{"192.0.2.10"})
+
+	InitializeOsResolver(false)
+
+	changes := logEventsWithPrefix(t, logs.String(), "OS resolver set changed")
+	if len(changes) != 1 {
+		t.Fatalf("got %d resolver change events, want 1: %s", len(changes), logs.String())
+	}
+	wantLogField(t, changes[0], "reason", "unspecified")
+	wantLogStrings(t, changes[0], "after", []string{"192.0.2.10"})
+}
+
+// A LAN-only query must reach the LAN nameservers and nothing else. A public
+// nameserver in the same pool, as DHCP hands out next to the router, is not
+// asked at all, so the name is never sent to it.
+func Test_osResolver_LanOnlyQuerySkipsPublicNameservers(t *testing.T) {
+	const lan, public = "10.0.0.53:53", "192.0.2.53:53"
+	resolver := newResolverWithNameserver([]string{lan, public, controldPublicDnsWithPort})
+
+	var mu sync.Mutex
+	var asked []string
+	resolver.exchangeDNS = func(_ context.Context, msg *dns.Msg, server string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		mu.Lock()
+		asked = append(asked, server)
+		mu.Unlock()
+		answer := new(dns.Msg)
+		answer.SetRcode(msg, dns.RcodeNameError)
+		return answer, time.Millisecond, nil
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("host.corp.example.", dns.TypeA)
+	answer, err := resolver.Resolve(LanOnlyQueryCtx(context.Background()), msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer.Rcode != dns.RcodeNameError {
+		t.Errorf("rcode = %s, want the LAN nameserver's NXDOMAIN", dns.RcodeToString[answer.Rcode])
+	}
+	if len(asked) != 1 || asked[0] != lan {
+		t.Fatalf("nameservers asked = %v, want only %s", asked, lan)
+	}
+}
+
+// With no LAN nameserver at all, a LAN-only query fails without sending
+// anything, rather than falling through to the public ones.
+func Test_osResolver_LanOnlyQueryWithoutLanNameserverSendsNothing(t *testing.T) {
+	resolver := newResolverWithNameserver([]string{"192.0.2.53:53", controldPublicDnsWithPort})
+	calls := 0
+	resolver.exchangeDNS = func(_ context.Context, msg *dns.Msg, _ string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		calls++
+		answer := new(dns.Msg)
+		answer.SetReply(msg)
+		return answer, time.Millisecond, nil
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("host.corp.example.", dns.TypeA)
+	if _, err := resolver.Resolve(LanOnlyQueryCtx(context.Background()), msg); err == nil {
+		t.Fatal("a LAN-only query with no LAN nameserver returned an answer")
+	}
+	if calls != 0 {
+		t.Fatalf("exchange calls = %d, want none", calls)
+	}
+}
+
+// The hot cache is keyed separately for LAN-only queries: an answer an
+// ordinary query got from a public nameserver must not serve a LAN-only one.
+func Test_osResolver_LanOnlyQueryDoesNotShareOrdinaryHotCache(t *testing.T) {
+	resolver := newResolverWithNameserver([]string{"192.0.2.53:53"})
+	resolver.exchangeDNS = func(_ context.Context, msg *dns.Msg, _ string, _ net.IP) (*dns.Msg, time.Duration, error) {
+		answer := new(dns.Msg)
+		answer.SetReply(msg)
+		return answer, time.Millisecond, nil
+	}
+
+	msg := new(dns.Msg)
+	msg.SetQuestion("host.corp.example.", dns.TypeA)
+	if _, err := resolver.Resolve(context.Background(), msg); err != nil {
+		t.Fatalf("ordinary query: %v", err)
+	}
+	if _, err := resolver.Resolve(LanOnlyQueryCtx(context.Background()), msg); err == nil {
+		t.Fatal("a LAN-only query was served the ordinary query's public answer from the hot cache")
+	}
 }

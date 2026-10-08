@@ -10,7 +10,7 @@ import (
 	"io"
 	"net"
 	"os/exec"
-	"regexp"
+	"runtime"
 	"slices"
 	"strings"
 	"time"
@@ -22,15 +22,23 @@ func dnsFns() []dnsFn {
 	return []dnsFn{dnsFromResolvConf, getDNSFromScutil, getAllDHCPNameservers}
 }
 
+var scutilLocalAddresses = netmon.LocalAddresses
+
 func getDNSFromScutil() []string {
 	logger := *ProxyLogger.Load()
+
+	// Skip scutil on mobile platforms - not available in sandbox
+	if isMobile() {
+		Log(context.Background(), logger.Debug(), "skipping scutil DNS discovery on mobile platform")
+		return nil
+	}
 
 	const (
 		maxRetries    = 10
 		retryInterval = 100 * time.Millisecond
 	)
 
-	regularIPs, loopbackIPs, _ := netmon.LocalAddresses()
+	regularIPs, loopbackIPs, _ := scutilLocalAddresses()
 
 	var nameservers []string
 	for attempt := 0; attempt < maxRetries; attempt++ {
@@ -45,36 +53,8 @@ func getDNSFromScutil() []string {
 			continue
 		}
 
-		var localDNS []string
-		seen := make(map[string]bool)
-
-		scanner := bufio.NewScanner(bytes.NewReader(output))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if strings.HasPrefix(line, "nameserver[") {
-				parts := strings.Split(line, ":")
-				if len(parts) == 2 {
-					ns := strings.TrimSpace(parts[1])
-					if ip := net.ParseIP(ns); ip != nil {
-						// skip loopback IPs
-						isLocal := false
-						for _, v := range slices.Concat(regularIPs, loopbackIPs) {
-							ipStr := v.String()
-							if ip.String() == ipStr {
-								isLocal = true
-								break
-							}
-						}
-						if !isLocal && !seen[ip.String()] {
-							seen[ip.String()] = true
-							localDNS = append(localDNS, ip.String())
-						}
-					}
-				}
-			}
-		}
-
-		if err := scanner.Err(); err != nil {
+		localDNS, err := parseScutilNameservers(output, slices.Concat(regularIPs, loopbackIPs))
+		if err != nil {
 			Log(context.Background(), logger.Error(), "error scanning scutil output (attempt %d/%d): %v", attempt+1, maxRetries, err)
 			continue
 		}
@@ -89,24 +69,27 @@ func getDNSFromScutil() []string {
 }
 
 func getDHCPNameservers(iface string) ([]string, error) {
-	// Run the ipconfig command for the given interface.
-	cmd := exec.Command("ipconfig", "getpacket", iface)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("error running ipconfig: %v", err)
+	// Skip ipconfig on mobile platforms - not available in sandbox
+	if isMobile() {
+		return nil, fmt.Errorf("ipconfig not available on mobile")
 	}
 
-	// Look for a line like:
-	//     domain_name_servers = 192.168.1.1 8.8.8.8;
-	re := regexp.MustCompile(`domain_name_servers\s*=\s*(.*);`)
-	matches := re.FindStringSubmatch(string(output))
-	if len(matches) < 2 {
-		return nil, fmt.Errorf("no DHCP nameservers found")
-	}
+	return dhcpNameserversFromCommands(context.Background(), iface, func(_ context.Context, args ...string) ([]byte, error) {
+		return exec.Command("ipconfig", args...).Output()
+	})
+}
 
-	// Split the nameservers by whitespace.
-	nameservers := strings.Fields(matches[1])
-	return nameservers, nil
+// DHCPNameserversForInterfaceContext bounds both commands with the caller's
+// context. Other system-discovery callers retain their existing behavior.
+func DHCPNameserversForInterfaceContext(ctx context.Context, iface string) ([]string, error) {
+	return dhcpNameserversFromCommands(ctx, iface, func(ctx context.Context, args ...string) ([]byte, error) {
+		return dhcpCommandOutput(ctx, "/usr/sbin/ipconfig", args...)
+	})
+}
+
+// DHCPNameserversForInterface returns DHCP option 6 for exactly iface.
+func DHCPNameserversForInterface(iface string) ([]string, error) {
+	return getDHCPNameservers(iface)
 }
 
 func getAllDHCPNameservers() []string {
@@ -201,6 +184,11 @@ func getAllDHCPNameservers() []string {
 }
 
 func patchNetIfaceName(iface *net.Interface) (bool, error) {
+	// Skip networksetup on mobile platforms - not available in sandbox
+	if isMobile() {
+		return false, nil
+	}
+
 	b, err := exec.Command("networksetup", "-listnetworkserviceorder").Output()
 	if err != nil {
 		return false, err
@@ -233,4 +221,9 @@ func networkServiceName(ifaceName string, r io.Reader) string {
 		}
 	}
 	return ""
+}
+
+// isMobile reports whether the current OS is a mobile platform.
+func isMobile() bool {
+	return runtime.GOOS == "ios"
 }

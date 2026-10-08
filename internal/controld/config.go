@@ -39,6 +39,16 @@ const (
 	sendLogTimeout     = 300 * time.Second
 )
 
+// Provisioning-token rejection reasons the API sends in error.metadata.reason
+// (HTTP 400, code 40003). This list can grow; a value outside it is not an
+// error, just one cmd/cli does not classify yet.
+const (
+	ReasonTokenInvalid      = "token_invalid"
+	ReasonTokenExpired      = "token_expired"
+	ReasonTokenLimitReached = "token_limit_reached"
+	ReasonTokenDisabled     = "token_disabled"
+)
+
 // ResolverConfig represents Control D resolver data.
 type ResolverConfig struct {
 	DOH   string `json:"doh"`
@@ -47,9 +57,42 @@ type ResolverConfig struct {
 		CustomLastUpdate int64  `json:"custom_last_update"`
 		VersionTarget    string `json:"version_target"`
 	} `json:"ctrld"`
-	Exclude         []string `json:"exclude"`
-	UID             string   `json:"uid"`
-	DeactivationPin *int64   `json:"deactivation_pin,omitempty"`
+	Exclude         []string   `json:"exclude"`
+	SplitDNS        []SplitDNS `json:"split_dns"`
+	UID             string     `json:"uid"`
+	DeactivationPin *int64     `json:"deactivation_pin,omitempty"`
+}
+
+// Internal Domain resolution modes. Mode is what the administrator selected;
+// Resolvers is only meaningful under SplitDNSModeResolvers and
+// SplitDNSModeResolversOnly.
+const (
+	// SplitDNSModeOS resolves the domain through the endpoint's own OS/default
+	// resolver, so it follows DHCP and VPN resolver changes.
+	SplitDNSModeOS = "os"
+	// SplitDNSModeResolvers resolves the domain through the addresses in
+	// Resolvers first. When none of them answers, or they answer SERVFAIL or
+	// NXDOMAIN, the query falls back to the resolvers of the endpoint's active
+	// network and VPN. This is the default explicit selection.
+	SplitDNSModeResolvers = "resolvers"
+	// SplitDNSModeResolversOnly resolves the domain through the addresses in
+	// Resolvers and nothing else: their answer, or their failure, is final.
+	SplitDNSModeResolversOnly = "resolvers_only"
+)
+
+// SplitDNS is one organization Internal Domain: a domain suffix, the resolution
+// mode the organization administrator selected for it, and the resolver
+// addresses that mode may need.
+//
+// Mode decides the routing. Resolvers is read only under the explicit modes,
+// so addresses left behind by an earlier selection cannot resurrect themselves
+// once the administrator switches back to the OS resolver. An empty Mode is a
+// deployment that predates the field; the caller infers the mode from
+// Resolvers in that case.
+type SplitDNS struct {
+	Domain    string   `json:"domain"`
+	Mode      string   `json:"mode"`
+	Resolvers []string `json:"resolvers"`
 }
 
 type utilityResponse struct {
@@ -59,26 +102,89 @@ type utilityResponse struct {
 	} `json:"body"`
 }
 
+// errorMetadata carries additive, optional detail on top of Code/Message.
+// Older API deployments omit it, so it must decode to its zero value rather
+// than fail the whole response. Its custom UnmarshalJSON gives the same
+// tolerance to a malformed value: a metadata that is not an object, or a
+// Reason that is not a string (a number, an object, or null), degrades to
+// the zero value rather than failing the response that contains it.
+type errorMetadata struct {
+	// Reason is a machine-readable rejection reason sent on provisioning-token
+	// errors (HTTP 400, code 40003): token_invalid, token_expired,
+	// token_limit_reached, or token_disabled. Empty when absent or malformed;
+	// callers must treat any other value as unknown rather than reject the
+	// response.
+	Reason string `json:"reason"`
+}
+
+func (m *errorMetadata) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Reason json.RawMessage `json:"reason"`
+	}
+	// Best-effort: a metadata that is not an object, or a reason that is not
+	// a string (number, object, null), leaves the zero value instead of
+	// failing this decode. Code and Message still classify the failure.
+	if err := json.Unmarshal(data, &raw); err != nil {
+		*m = errorMetadata{}
+		return nil
+	}
+	_ = json.Unmarshal(raw.Reason, &m.Reason)
+	return nil
+}
+
 type ErrorResponse struct {
 	ErrorField struct {
-		Message string `json:"message"`
-		Code    int    `json:"code"`
+		Message  string        `json:"message"`
+		Code     int           `json:"code"`
+		Metadata errorMetadata `json:"metadata"`
 	} `json:"error"`
+	// StatusCode is the HTTP status the API answered with. It is not part of the JSON
+	// body: this type is built for *any* non-200 whose body decodes, so the body alone
+	// cannot tell a permanent rejection of the request from a transient server-side
+	// failure, and callers that act differently on the two need the status to tell them
+	// apart. Zero means the status was not recorded.
+	StatusCode int `json:"-"`
 }
 
 func (u ErrorResponse) Error() string {
 	return u.ErrorField.Message
 }
 
+// apiErrorFromResponse builds the error for a non-200 API answer, recording the HTTP
+// status alongside the decoded body.
+//
+// The status is what tells a caller whether the answer will change on a retry: this type
+// is built for every non-200 whose body decodes, so a 502 from a load balancer and a 404
+// for a deleted device are otherwise indistinguishable. Both response paths go through
+// here so neither can decode a body and forget to record it.
+func apiErrorFromResponse(statusCode int, d *json.Decoder) (*ErrorResponse, error) {
+	errResp := &ErrorResponse{StatusCode: statusCode}
+	if err := d.Decode(errResp); err != nil {
+		return nil, err
+	}
+	// Decode fills exported fields from the body; StatusCode is json:"-", so it survives.
+	errResp.StatusCode = statusCode
+	return errResp, nil
+}
+
 type utilityRequest struct {
-	UID      string `json:"uid"`
-	ClientID string `json:"client_id,omitempty"`
+	UID      string            `json:"uid"`
+	ClientID string            `json:"client_id,omitempty"`
+	Metadata map[string]string `json:"metadata"`
 }
 
 // UtilityOrgRequest contains request data for calling Org API.
 type UtilityOrgRequest struct {
-	ProvToken string `json:"prov_token"`
-	Hostname  string `json:"hostname"`
+	ProvToken string            `json:"prov_token"`
+	Hostname  string            `json:"hostname"`
+	Metadata  map[string]string `json:"metadata"`
+}
+
+// ResolverConfigRequest contains request data for fetching resolver config.
+type ResolverConfigRequest struct {
+	RawUID   string
+	Version  string
+	Metadata map[string]string
 }
 
 // LogsRequest contains request data for sending runtime logs to API.
@@ -88,46 +194,64 @@ type LogsRequest struct {
 }
 
 // FetchResolverConfig fetch Control D config for given uid.
-func FetchResolverConfig(rawUID, version string, cdDev bool) (*ResolverConfig, error) {
-	uid, clientID := ParseRawUID(rawUID)
-	req := utilityRequest{UID: uid}
-	if clientID != "" {
-		req.ClientID = clientID
+func FetchResolverConfig(ctx context.Context, req *ResolverConfigRequest, cdDev bool) (*ResolverConfig, error) {
+	uid, clientID := ParseRawUID(req.RawUID)
+	uReq := utilityRequest{
+		UID:      uid,
+		Metadata: req.Metadata,
 	}
-	body, _ := json.Marshal(req)
-	return postUtilityAPI(version, cdDev, false, bytes.NewReader(body))
+	if clientID != "" {
+		uReq.ClientID = clientID
+	}
+	body, _ := json.Marshal(uReq)
+	return postUtilityAPI(ctx, req.Version, cdDev, false, bytes.NewReader(body))
 }
 
-// FetchResolverUID fetch resolver uid from provision token.
-func FetchResolverUID(req *UtilityOrgRequest, version string, cdDev bool) (*ResolverConfig, error) {
+// FetchResolverUID fetch resolver uid from a given request.
+func FetchResolverUID(ctx context.Context, req *UtilityOrgRequest, version string, cdDev bool) (*ResolverConfig, error) {
 	if req == nil {
 		return nil, errors.New("invalid request")
 	}
-	hostname := req.Hostname
-	if hostname == "" {
-		hostname, _ = os.Hostname()
+	if req.Hostname == "" {
+		hostname, _ := preferredHostname()
+		ctrld.ProxyLogger.Load().Debug().Msgf("Using system hostname: %s", hostname)
+		req.Hostname = hostname
 	}
-	body, _ := json.Marshal(UtilityOrgRequest{ProvToken: req.ProvToken, Hostname: hostname})
-	return postUtilityAPI(version, cdDev, false, bytes.NewReader(body))
+
+	// Include all hostname sources in metadata so the API can pick the
+	// best one if the primary looks generic (e.g., "Mac", "Mac.lan").
+	if req.Metadata == nil {
+		req.Metadata = make(map[string]string)
+	}
+	for k, v := range hostnameHints() {
+		req.Metadata["hostname_"+k] = v
+	}
+	ctrld.ProxyLogger.Load().Debug().Msgf("Sending UID request to ControlD API")
+
+	body, _ := json.Marshal(req)
+	return postUtilityAPI(ctx, version, cdDev, false, bytes.NewReader(body))
 }
 
 // UpdateCustomLastFailed calls API to mark custom config is bad.
-func UpdateCustomLastFailed(rawUID, version string, cdDev, lastUpdatedFailed bool) (*ResolverConfig, error) {
+func UpdateCustomLastFailed(ctx context.Context, rawUID, version string, cdDev, lastUpdatedFailed bool) (*ResolverConfig, error) {
 	uid, clientID := ParseRawUID(rawUID)
 	req := utilityRequest{UID: uid}
 	if clientID != "" {
 		req.ClientID = clientID
 	}
 	body, _ := json.Marshal(req)
-	return postUtilityAPI(version, cdDev, true, bytes.NewReader(body))
+	return postUtilityAPI(ctx, version, cdDev, true, bytes.NewReader(body))
 }
 
-func postUtilityAPI(version string, cdDev, lastUpdatedFailed bool, body io.Reader) (*ResolverConfig, error) {
+func postUtilityAPI(ctx context.Context, version string, cdDev, lastUpdatedFailed bool, body io.Reader) (*ResolverConfig, error) {
 	apiUrl := resolverDataURLCom
 	if cdDev {
 		apiUrl = resolverDataURLDev
 	}
-	req, err := http.NewRequest("POST", apiUrl, body)
+	// Context-bound so an in-flight request is abandoned when the caller is
+	// cancelled - a service stop during API preflight must not wait out the
+	// request timeout, let alone keep retrying.
+	req, err := http.NewRequestWithContext(ctx, "POST", apiUrl, body)
 	if err != nil {
 		return nil, fmt.Errorf("http.NewRequest: %w", err)
 	}
@@ -151,8 +275,8 @@ func postUtilityAPI(version string, cdDev, lastUpdatedFailed bool, body io.Reade
 	defer resp.Body.Close()
 	d := json.NewDecoder(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		errResp := &ErrorResponse{}
-		if err := d.Decode(errResp); err != nil {
+		errResp, err := apiErrorFromResponse(resp.StatusCode, d)
+		if err != nil {
 			return nil, err
 		}
 		return nil, errResp
@@ -166,16 +290,24 @@ func postUtilityAPI(version string, cdDev, lastUpdatedFailed bool, body io.Reade
 }
 
 // SendLogs sends runtime log to ControlD API.
-func SendLogs(lr *LogsRequest, cdDev bool) error {
+func SendLogs(ctx context.Context, lr *LogsRequest, cdDev bool) error {
 	defer lr.Data.Close()
 	apiUrl := logURLCom
 	if cdDev {
 		apiUrl = logURLDev
 	}
-	req, err := http.NewRequest("POST", apiUrl, lr.Data)
+	body, size, getBody, cleanup, err := spoolLogBody(lr.Data)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	req, err := http.NewRequestWithContext(ctx, "POST", apiUrl, body)
 	if err != nil {
 		return fmt.Errorf("http.NewRequest: %w", err)
 	}
+	req.ContentLength = size
+	req.GetBody = getBody
 	q := req.URL.Query()
 	q.Set("uid", lr.UID)
 	req.URL.RawQuery = q.Encode()
@@ -192,8 +324,8 @@ func SendLogs(lr *LogsRequest, cdDev bool) error {
 	defer resp.Body.Close()
 	d := json.NewDecoder(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		errResp := &ErrorResponse{}
-		if err := d.Decode(errResp); err != nil {
+		errResp, err := apiErrorFromResponse(resp.StatusCode, d)
+		if err != nil {
 			return err
 		}
 		return errResp
@@ -270,7 +402,7 @@ func apiTransport(cdDev bool) *http.Transport {
 		return dial(ctx, "tcp6", addrsFromPort(apiIpsV6, port))
 	}
 	if router.Name() == ddwrt.Name || runtime.GOOS == "android" {
-		transport.TLSClientConfig = &tls.Config{RootCAs: certs.CACertPool()}
+		transport.TLSClientConfig = &tls.Config{RootCAs: certs.CACertPool(), MinVersion: tls.VersionTLS12}
 	}
 	return transport
 }
@@ -283,16 +415,66 @@ func addrsFromPort(ips []string, port string) []string {
 	return addrs
 }
 
+// doWithFallback sends req, retrying against apiIp directly if the first attempt
+// fails (typically because DNS is not usable yet).
+//
+// Both failures are reported. The first attempt carries the diagnosis - on Windows
+// a local firewall denying the socket surfaces there as WSAEACCES ("An attempt was
+// made to access a socket in a way forbidden by its access permissions"), which
+// says the host is blocking ctrld rather than that the network is down. Returning
+// only the fallback error hid that behind a bare "no route to host" from the IPv6
+// attempt.
 func doWithFallback(client *http.Client, req *http.Request, apiIp string) (*http.Response, error) {
 	resp, err := client.Do(req)
-	if err != nil {
-		ctrld.ProxyLogger.Load().Warn().Err(err).Msgf("failed to send request, fallback to direct IP: %s", apiIp)
-		ipReq := req.Clone(req.Context())
-		ipReq.Host = apiIp
-		ipReq.URL.Host = apiIp
-		resp, err = client.Do(ipReq)
+	if err == nil {
+		return resp, nil
 	}
-	return resp, err
+	ctrld.ProxyLogger.Load().Warn().Err(err).Msgf("failed to send request, fallback to direct IP: %s", apiIp)
+	ipReq := req.Clone(req.Context())
+	ipReq.Host = apiIp
+	ipReq.URL.Host = apiIp
+	// The first attempt consumed the body. A request that can give its body
+	// again sends the whole body a second time.
+	if req.GetBody != nil {
+		body, bodyErr := req.GetBody()
+		if bodyErr != nil {
+			return nil, fmt.Errorf("request failed: %w; fallback to direct ip %s failed: %w", err, apiIp, bodyErr)
+		}
+		ipReq.Body = body
+	}
+	resp, fallbackErr := client.Do(ipReq)
+	if fallbackErr != nil {
+		return nil, fmt.Errorf("request failed: %w; fallback to direct ip %s failed: %w", err, apiIp, fallbackErr)
+	}
+	return resp, nil
+}
+
+// spoolLogBody copies an upload to a temporary file, so the request can go
+// out a second time to the direct IP of the API. A log reader yields its
+// bytes once, and the first attempt consumes them. The caller runs cleanup
+// after the response arrived.
+func spoolLogBody(data io.Reader) (body *os.File, size int64, getBody func() (io.ReadCloser, error), cleanup func(), err error) {
+	f, err := os.CreateTemp("", "ctrld-log-upload-*")
+	if err != nil {
+		return nil, 0, nil, nil, fmt.Errorf("creating the upload spool: %w", err)
+	}
+	cleanup = func() {
+		_ = f.Close()
+		_ = os.Remove(f.Name())
+	}
+	size, err = io.Copy(f, data)
+	if err != nil {
+		cleanup()
+		return nil, 0, nil, nil, fmt.Errorf("writing the upload spool: %w", err)
+	}
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, 0, nil, nil, fmt.Errorf("rewinding the upload spool: %w", err)
+	}
+	// The transport closes the body of a failed attempt, so the second body
+	// is a new handle on the same file.
+	getBody = func() (io.ReadCloser, error) { return os.Open(f.Name()) }
+	return f, size, getBody, cleanup, nil
 }
 
 // apiServerIP returns the direct IP to connect to API server.
@@ -301,4 +483,11 @@ func apiServerIP(cdDev bool) string {
 		return apiDomainDevIPv4
 	}
 	return apiDomainComIPv4
+}
+
+// DoWithFallbackForTest exposes doWithFallback so tests outside this package can drive
+// the real two-attempt composition through the real retry predicate, rather than
+// asserting a copy of this error shape against another copy of it.
+func DoWithFallbackForTest(client *http.Client, req *http.Request, apiIp string) (*http.Response, error) {
+	return doWithFallback(client, req, apiIp)
 }

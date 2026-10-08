@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
 	"net"
 	"net/http"
 	"net/netip"
@@ -79,10 +78,20 @@ const (
 	controlDNetDomain = "controld.net"
 	controlDDevDomain = "controld.dev"
 
+	// nextDNSDomain is the parent domain of the NextDNS DoH endpoints. Beside
+	// dns.nextdns.io, NextDNS serves alternative endpoints under it, such as
+	// ultralow.dns.nextdns.io and anycast.dns2.nextdns.io, which are the same
+	// service and take the same client info headers.
+	nextDNSDomain = "nextdns.io"
+
 	endpointPrefixHTTPS = "https://"
 	endpointPrefixQUIC  = "quic://"
 	endpointPrefixH3    = "h3://"
 	endpointPrefixSdns  = "sdns://"
+
+	rebootstrapNotStarted = 0
+	rebootstrapStarted    = 1
+	rebootstrapInProgress = 2
 )
 
 var (
@@ -215,6 +224,8 @@ func (c *Config) FirstUpstream() *UpstreamConfig {
 type ServiceConfig struct {
 	LogLevel                string         `mapstructure:"log_level" toml:"log_level,omitempty"`
 	LogPath                 string         `mapstructure:"log_path" toml:"log_path,omitempty"`
+	LogMaxSizeMB            int            `mapstructure:"log_max_size_mb" toml:"log_max_size_mb,omitempty" validate:"omitempty,gte=1,lte=1024"`
+	LogMaxBackups           *int           `mapstructure:"log_max_backups" toml:"log_max_backups,omitempty" validate:"omitempty,gte=0,lte=64"`
 	CacheEnable             bool           `mapstructure:"cache_enable" toml:"cache_enable,omitempty"`
 	CacheSize               int            `mapstructure:"cache_size" toml:"cache_size,omitempty"`
 	CacheTTLOverride        int            `mapstructure:"cache_ttl_override" toml:"cache_ttl_override,omitempty"`
@@ -237,6 +248,9 @@ type ServiceConfig struct {
 	RefetchTime             *int           `mapstructure:"refetch_time" toml:"refetch_time,omitempty"`
 	ForceRefetchWaitTime    *int           `mapstructure:"force_refetch_wait_time" toml:"force_refetch_wait_time,omitempty"`
 	LeakOnUpstreamFailure   *bool          `mapstructure:"leak_on_upstream_failure" toml:"leak_on_upstream_failure,omitempty"`
+	InterceptMode           string         `mapstructure:"intercept_mode" toml:"intercept_mode,omitempty" validate:"omitempty,oneof=off dns hard"`
+	NRPTRecoveryMaxAttempts *int           `mapstructure:"nrpt_recovery_max_attempts" toml:"nrpt_recovery_max_attempts,omitempty" validate:"omitempty,gte=0"`
+	NRPTRecoveryCooldown    *time.Duration `mapstructure:"nrpt_recovery_cooldown" toml:"nrpt_recovery_cooldown,omitempty"`
 	Daemon                  bool           `mapstructure:"-" toml:"-"`
 	AllocateIP              bool           `mapstructure:"-" toml:"-"`
 }
@@ -255,8 +269,13 @@ type UpstreamConfig struct {
 	Endpoint    string `mapstructure:"endpoint" toml:"endpoint,omitempty"`
 	BootstrapIP string `mapstructure:"bootstrap_ip" toml:"bootstrap_ip,omitempty"`
 	Domain      string `mapstructure:"-" toml:"-"`
-	IPStack     string `mapstructure:"ip_stack" toml:"ip_stack,omitempty" validate:"ipstack"`
-	Timeout     int    `mapstructure:"timeout" toml:"timeout,omitempty" validate:"gte=0"`
+	// InternalDomain is set only by ctrld, on the upstreams it generates for
+	// organization Internal Domains, to the mode they serve. It is never read
+	// from or written to a configuration file, so an upstream a configuration
+	// defines is never mistaken for a generated one, whatever it is named.
+	InternalDomain string `mapstructure:"-" toml:"-"`
+	IPStack        string `mapstructure:"ip_stack" toml:"ip_stack,omitempty" validate:"ipstack"`
+	Timeout        int    `mapstructure:"timeout" toml:"timeout,omitempty" validate:"gte=0"`
 	// The caller should not access this field directly.
 	// Use UpstreamSendClientInfo instead.
 	SendClientInfo *bool `mapstructure:"send_client_info" toml:"send_client_info,omitempty"`
@@ -265,7 +284,7 @@ type UpstreamConfig struct {
 	Discoverable *bool `mapstructure:"discoverable" toml:"discoverable"`
 
 	g                  singleflight.Group
-	rebootstrap        atomic.Bool
+	rebootstrap        atomic.Int64
 	bootstrapIPs       []string
 	bootstrapIPs4      []string
 	bootstrapIPs6      []string
@@ -276,6 +295,12 @@ type UpstreamConfig struct {
 	http3RoundTripper  http.RoundTripper
 	http3RoundTripper4 http.RoundTripper
 	http3RoundTripper6 http.RoundTripper
+	doqConnPool        *doqConnPool
+	doqConnPool4       *doqConnPool
+	doqConnPool6       *doqConnPool
+	dotClientPool      *dotConnPool
+	dotClientPool4     *dotConnPool
+	dotClientPool6     *dotConnPool
 	certPool           *x509.CertPool
 	u                  *url.URL
 	fallbackOnce       sync.Once
@@ -490,54 +515,171 @@ func (uc *UpstreamConfig) SetupBootstrapIP() {
 // ReBootstrap re-setup the bootstrap IP and the transport.
 func (uc *UpstreamConfig) ReBootstrap() {
 	switch uc.Type {
-	case ResolverTypeDOH, ResolverTypeDOH3:
+	case ResolverTypeDOH, ResolverTypeDOH3, ResolverTypeDOQ, ResolverTypeDOT:
 	default:
 		return
 	}
 	_, _, _ = uc.g.Do("ReBootstrap", func() (any, error) {
-		if uc.rebootstrap.CompareAndSwap(false, true) {
+		if uc.rebootstrap.CompareAndSwap(rebootstrapNotStarted, rebootstrapStarted) {
 			ProxyLogger.Load().Debug().Msgf("re-bootstrapping upstream ip for %v", uc)
 		}
 		return true, nil
 	})
 }
 
-// SetupTransport initializes the network transport used to connect to upstream server.
-// For now, only DoH upstream is supported.
-func (uc *UpstreamConfig) SetupTransport() {
+// ForceReBootstrap immediately replaces the upstream transport, closing old
+// connections and creating new ones synchronously. Unlike ReBootstrap() which
+// sets a lazy flag (new transport created on next query), this ensures the
+// transport is ready before any queries arrive. Use when external events
+// (e.g. firewall state flush) are known to have killed existing connections.
+func (uc *UpstreamConfig) ForceReBootstrap() {
 	switch uc.Type {
-	case ResolverTypeDOH:
-		uc.setupDOHTransport()
-	case ResolverTypeDOH3:
-		uc.setupDOH3Transport()
+	case ResolverTypeDOH, ResolverTypeDOH3, ResolverTypeDOQ, ResolverTypeDOT:
+	default:
+		return
+	}
+	ProxyLogger.Load().Debug().Msgf("force re-bootstrapping upstream transport for %v", uc)
+	uc.SetupTransport()
+	// Clear any pending lazy re-bootstrap flag so ensureSetupTransport()
+	// doesn't redundantly recreate the transport we just built.
+	uc.rebootstrap.Store(rebootstrapNotStarted)
+}
+
+// CloseTransports retires the upstream's transports, including active DoT and
+// HTTP/3 connections. Callers must stop publishing this upstream before calling
+// it and must not reuse it without calling SetupTransport.
+func (uc *UpstreamConfig) CloseTransports() {
+	uc.retireTransports()
+}
+
+// retireTransports permanently closes DoT pools and HTTP/3 transports before
+// their owner discards them. Like closeTransports, it does not acquire an
+// upstream lock: callers that serialize slot access must keep that serialization
+// across retirement and replacement.
+func (uc *UpstreamConfig) retireTransports() {
+	uc.closeTransports()
+	for _, p := range []*dotConnPool{uc.dotClientPool, uc.dotClientPool4, uc.dotClientPool6} {
+		if p != nil {
+			p.Close()
+		}
+	}
+	// Unlike CloseIdleConnections, Close also cancels pending dials and active
+	// HTTP/3 requests, and prevents late requests from reviving the transport.
+	for _, rt := range []http.RoundTripper{uc.http3RoundTripper, uc.http3RoundTripper4, uc.http3RoundTripper6} {
+		if c, ok := rt.(interface{ Close() error }); ok {
+			_ = c.Close()
+		}
 	}
 }
 
-func (uc *UpstreamConfig) setupDOHTransport() {
+// closeTransports closes idle connections on all existing transports.
+// It does not retire DoT pools or HTTP/3 transports: active work may continue
+// and the resources remain usable. Use retireTransports before replacing them.
+func (uc *UpstreamConfig) closeTransports() {
+	if t := uc.transport; t != nil {
+		t.CloseIdleConnections()
+	}
+	if t := uc.transport4; t != nil {
+		t.CloseIdleConnections()
+	}
+	if t := uc.transport6; t != nil {
+		t.CloseIdleConnections()
+	}
+	if p := uc.doqConnPool; p != nil {
+		p.CloseIdleConnections()
+	}
+	if p := uc.doqConnPool4; p != nil {
+		p.CloseIdleConnections()
+	}
+	if p := uc.doqConnPool6; p != nil {
+		p.CloseIdleConnections()
+	}
+	if p := uc.dotClientPool; p != nil {
+		p.CloseIdleConnections()
+	}
+	if p := uc.dotClientPool4; p != nil {
+		p.CloseIdleConnections()
+	}
+	if p := uc.dotClientPool6; p != nil {
+		p.CloseIdleConnections()
+	}
+	// http3RoundTripper is stored as http.RoundTripper but the concrete type
+	// (*http3.Transport) exposes CloseIdleConnections via this interface.
+	type idleCloser interface {
+		CloseIdleConnections()
+	}
+	for _, rt := range []http.RoundTripper{uc.http3RoundTripper, uc.http3RoundTripper4, uc.http3RoundTripper6} {
+		if c, ok := rt.(idleCloser); ok {
+			c.CloseIdleConnections()
+		}
+	}
+}
+
+// SetupTransport initializes the network transport used to connect to upstream servers.
+// For now, DoH/DoH3/DoQ/DoT upstreams are supported.
+func (uc *UpstreamConfig) SetupTransport() {
+	switch uc.Type {
+	case ResolverTypeDOH, ResolverTypeDOH3, ResolverTypeDOQ, ResolverTypeDOT:
+	default:
+		return
+	}
+
+	// Retire old DoT/HTTP3 resources before replacing their slots. Idle-only
+	// cleanup would leave active queries and late work owning orphaned resources.
+	// DoH and DoQ retain their existing cleanup semantics.
+	uc.retireTransports()
+
+	ips := uc.bootstrapIPs
 	switch uc.IPStack {
-	case IpStackBoth, "":
-		uc.transport = uc.newDOHTransport(uc.bootstrapIPs)
 	case IpStackV4:
-		uc.transport = uc.newDOHTransport(uc.bootstrapIPs4)
+		ips = uc.bootstrapIPs4
 	case IpStackV6:
-		uc.transport = uc.newDOHTransport(uc.bootstrapIPs6)
-	case IpStackSplit:
+		ips = uc.bootstrapIPs6
+	}
+
+	uc.transport = uc.newDOHTransport(ips)
+	uc.http3RoundTripper = uc.newDOH3Transport(ips)
+	uc.doqConnPool = uc.newDOQConnPool(ips)
+	uc.dotClientPool = uc.newDOTClientPool(ips)
+	if uc.IPStack == IpStackSplit {
 		uc.transport4 = uc.newDOHTransport(uc.bootstrapIPs4)
+		uc.http3RoundTripper4 = uc.newDOH3Transport(uc.bootstrapIPs4)
+		uc.doqConnPool4 = uc.newDOQConnPool(uc.bootstrapIPs4)
+		uc.dotClientPool4 = uc.newDOTClientPool(uc.bootstrapIPs4)
 		if HasIPv6() {
 			uc.transport6 = uc.newDOHTransport(uc.bootstrapIPs6)
+			uc.http3RoundTripper6 = uc.newDOH3Transport(uc.bootstrapIPs6)
+			uc.doqConnPool6 = uc.newDOQConnPool(uc.bootstrapIPs6)
+			uc.dotClientPool6 = uc.newDOTClientPool(uc.bootstrapIPs6)
 		} else {
 			uc.transport6 = uc.transport4
+			uc.http3RoundTripper6 = uc.http3RoundTripper4
+			uc.doqConnPool6 = uc.doqConnPool4
+			uc.dotClientPool6 = uc.dotClientPool4
 		}
-		uc.transport = uc.newDOHTransport(uc.bootstrapIPs)
+	}
+}
+
+func (uc *UpstreamConfig) ensureSetupTransport() {
+	uc.transportOnce.Do(func() {
+		uc.SetupTransport()
+	})
+	if uc.rebootstrap.CompareAndSwap(rebootstrapStarted, rebootstrapInProgress) {
+		uc.SetupTransport()
+		uc.rebootstrap.Store(rebootstrapNotStarted)
 	}
 }
 
 func (uc *UpstreamConfig) newDOHTransport(addrs []string) *http.Transport {
+	if uc.Type != ResolverTypeDOH {
+		return nil
+	}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.MaxIdleConnsPerHost = 100
 	transport.TLSClientConfig = &tls.Config{
 		RootCAs:            uc.certPool,
 		ClientSessionCache: tls.NewLRUClientSessionCache(0),
+		MinVersion:         tls.VersionTLS12,
 	}
 
 	// Prevent bad tcp connection hanging the requests for too long.
@@ -595,7 +737,7 @@ func (uc *UpstreamConfig) ErrorPing() error {
 
 func (uc *UpstreamConfig) ping() error {
 	switch uc.Type {
-	case ResolverTypeDOH, ResolverTypeDOH3:
+	case ResolverTypeDOH, ResolverTypeDOH3, ResolverTypeDOQ:
 	default:
 		return nil
 	}
@@ -629,6 +771,14 @@ func (uc *UpstreamConfig) ping() error {
 			if err := ping(uc.doh3Transport(typ)); err != nil {
 				return err
 			}
+		case ResolverTypeDOQ:
+			// For DoQ, we just ensure transport is set up by calling doqTransport
+			// DoQ doesn't use HTTP, so we can't ping it the same way
+			_ = uc.doqTransport(typ)
+		case ResolverTypeDOT:
+			// For DoT, we just ensure transport is set up by calling dotTransport
+			// DoT doesn't use HTTP, so we can't ping it the same way
+			_ = uc.dotTransport(typ)
 		}
 	}
 
@@ -651,6 +801,7 @@ func (uc *UpstreamConfig) IsControlD() bool {
 	return false
 }
 
+// isNextDNS reports whether this is a NextDNS upstream.
 func (uc *UpstreamConfig) isNextDNS() bool {
 	domain := uc.Domain
 	if domain == "" {
@@ -658,50 +809,12 @@ func (uc *UpstreamConfig) isNextDNS() bool {
 			domain = u.Hostname()
 		}
 	}
-	return domain == "dns.nextdns.io"
+	return dns.IsSubDomain(nextDNSDomain, domain)
 }
 
 func (uc *UpstreamConfig) dohTransport(dnsType uint16) http.RoundTripper {
-	uc.transportOnce.Do(func() {
-		uc.SetupTransport()
-	})
-	if uc.rebootstrap.CompareAndSwap(true, false) {
-		uc.SetupTransport()
-	}
-	switch uc.IPStack {
-	case IpStackBoth, IpStackV4, IpStackV6:
-		return uc.transport
-	case IpStackSplit:
-		switch dnsType {
-		case dns.TypeA:
-			return uc.transport4
-		default:
-			return uc.transport6
-		}
-	}
-	return uc.transport
-}
-
-func (uc *UpstreamConfig) bootstrapIPForDNSType(dnsType uint16) string {
-	switch uc.IPStack {
-	case IpStackBoth:
-		return pick(uc.bootstrapIPs)
-	case IpStackV4:
-		return pick(uc.bootstrapIPs4)
-	case IpStackV6:
-		return pick(uc.bootstrapIPs6)
-	case IpStackSplit:
-		switch dnsType {
-		case dns.TypeA:
-			return pick(uc.bootstrapIPs4)
-		default:
-			if HasIPv6() {
-				return pick(uc.bootstrapIPs6)
-			}
-			return pick(uc.bootstrapIPs4)
-		}
-	}
-	return pick(uc.bootstrapIPs)
+	uc.ensureSetupTransport()
+	return transportByIpStack(uc.IPStack, dnsType, uc.transport, uc.transport4, uc.transport6)
 }
 
 func (uc *UpstreamConfig) netForDNSType(dnsType uint16) (string, string) {
@@ -946,10 +1059,6 @@ func ResolverTypeFromEndpoint(endpoint string) string {
 	return ResolverTypeDOT
 }
 
-func pick(s []string) string {
-	return s[rand.Intn(len(s))]
-}
-
 // upstreamUID generates an unique identifier for an upstream.
 func upstreamUID() string {
 	b := make([]byte, 4)
@@ -984,4 +1093,19 @@ func bootstrapIPsFromControlDDomain(domain string) []string {
 		return []string{freeDNSBoostrapIP, freeDNSBoostrapIPv6}
 	}
 	return nil
+}
+
+func transportByIpStack[T any](ipStack string, dnsType uint16, transport, transport4, transport6 T) T {
+	switch ipStack {
+	case IpStackBoth, IpStackV4, IpStackV6:
+		return transport
+	case IpStackSplit:
+		switch dnsType {
+		case dns.TypeA:
+			return transport4
+		default:
+			return transport6
+		}
+	}
+	return transport
 }

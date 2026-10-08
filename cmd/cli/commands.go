@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/docker/go-units"
@@ -34,11 +36,52 @@ import (
 // dialSocketControlServerTimeout is the default timeout to wait when ping control server.
 const dialSocketControlServerTimeout = 30 * time.Second
 
+// logRequestPath adds the query that makes the control server read every log
+// file, not only the newest debug bytes.
+func logRequestPath(path string, full bool) string {
+	if !full {
+		return path
+	}
+	return path + "?full=1"
+}
+
+// removeLogFiles deletes the log files of this installation and returns what
+// it could not remove. A missing file is not an error.
+func removeLogFiles(logPath string, backups int, internalPaths []string) []error {
+	for _, path := range internalPaths {
+		pruneNumberedBackups(path, 0)
+	}
+	var errs []error
+	for _, path := range logFilesToRemove(logPath, backups, internalPaths) {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			errs = append(errs, fmt.Errorf("remove %s: %w", path, err))
+		}
+	}
+	return errs
+}
+
+// logFilesToRemove names the log files of this installation. The log_path
+// backups come from the configured count, because log_path can name a file in
+// a directory that holds the files of other programs, and a scan of that
+// directory would take their files too. An empty logPath leaves the internal
+// files alone.
+func logFilesToRemove(logPath string, backups int, internalPaths []string) []string {
+	var paths []string
+	if logPath != "" {
+		paths = append(paths, logPath)
+		for index := 1; index <= backups; index++ {
+			paths = append(paths, fmt.Sprintf("%s.%d", logPath, index))
+		}
+	}
+	return append(paths, internalPaths...)
+}
+
 func initLogCmd() *cobra.Command {
 	warnRuntimeLoggingNotEnabled := func() {
 		mainLog.Load().Warn().Msg("runtime debug logging is not enabled")
 		mainLog.Load().Warn().Msg(`ctrld may be running without "--cd" flag or logging is already enabled`)
 	}
+	var sendFullLogs bool
 	logSendCmd := &cobra.Command{
 		Use:   "send",
 		Short: "Send runtime debug logs to ControlD",
@@ -66,7 +109,7 @@ func initLogCmd() *cobra.Command {
 				mainLog.Load().Fatal().Err(err).Msg("failed to find ctrld home dir")
 			}
 			cc := newControlClient(filepath.Join(dir, ctrldControlUnixSock))
-			resp, err := cc.post(sendLogsPath, nil)
+			resp, err := cc.post(logRequestPath(sendLogsPath, sendFullLogs), nil)
 			if err != nil {
 				mainLog.Load().Fatal().Err(err).Msg("failed to send logs")
 			}
@@ -92,6 +135,9 @@ func initLogCmd() *cobra.Command {
 			}
 		},
 	}
+	logSendCmd.Flags().BoolVar(&sendFullLogs, "full", false, "Send every log file, not only the newest 10 MB of debug")
+
+	var viewFullLogs bool
 	logViewCmd := &cobra.Command{
 		Use:   "view",
 		Short: "View current runtime debug logs",
@@ -119,7 +165,7 @@ func initLogCmd() *cobra.Command {
 				mainLog.Load().Fatal().Err(err).Msg("failed to find ctrld home dir")
 			}
 			cc := newControlClient(filepath.Join(dir, ctrldControlUnixSock))
-			resp, err := cc.post(viewLogsPath, nil)
+			resp, err := cc.post(logRequestPath(viewLogsPath, viewFullLogs), nil)
 			if err != nil {
 				mainLog.Load().Fatal().Err(err).Msg("failed to get logs")
 			}
@@ -146,6 +192,90 @@ func initLogCmd() *cobra.Command {
 			fmt.Println(logs.Data)
 		},
 	}
+	logViewCmd.Flags().BoolVar(&viewFullLogs, "full", false, "Show every log file, not only the newest 10 MB of debug")
+
+	var tailLines int
+	logTailCmd := &cobra.Command{
+		Use:   "tail",
+		Short: "Tail live runtime debug logs",
+		Long:  "Stream live runtime debug logs to the terminal, similar to tail -f. Press Ctrl+C to stop.",
+		Args:  cobra.NoArgs,
+		PreRun: func(cmd *cobra.Command, args []string) {
+			checkHasElevatedPrivilege()
+		},
+		Run: func(cmd *cobra.Command, args []string) {
+
+			p := &prog{router: router.New(&cfg, false)}
+			s, _ := newService(p, svcConfig)
+
+			status, err := s.Status()
+			if errors.Is(err, service.ErrNotInstalled) {
+				mainLog.Load().Warn().Msg("service not installed")
+				return
+			}
+			if status == service.StatusStopped {
+				mainLog.Load().Warn().Msg("service is not running")
+				return
+			}
+
+			dir, err := socketDir()
+			if err != nil {
+				mainLog.Load().Fatal().Err(err).Msg("failed to find ctrld home dir")
+			}
+			cc := newControlClient(filepath.Join(dir, ctrldControlUnixSock))
+			tailPath := fmt.Sprintf("%s?lines=%d", tailLogsPath, tailLines)
+			resp, err := cc.postStream(tailPath, nil)
+			if err != nil {
+				mainLog.Load().Fatal().Err(err).Msg("failed to connect for log tailing")
+			}
+			defer resp.Body.Close()
+
+			switch resp.StatusCode {
+			case http.StatusMovedPermanently:
+				warnRuntimeLoggingNotEnabled()
+				return
+			case http.StatusOK:
+			default:
+				mainLog.Load().Fatal().Msgf("unexpected response status: %d", resp.StatusCode)
+				return
+			}
+
+			// Set up signal handling for clean shutdown.
+			ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+
+			done := make(chan struct{})
+			go func() {
+				defer close(done)
+				// Stream output to stdout.
+				buf := make([]byte, 4096)
+				for {
+					n, readErr := resp.Body.Read(buf)
+					if n > 0 {
+						os.Stdout.Write(buf[:n])
+					}
+					if readErr != nil {
+						if readErr != io.EOF {
+							mainLog.Load().Error().Err(readErr).Msg("error reading log stream")
+						}
+						return
+					}
+				}
+			}()
+
+			select {
+			case <-ctx.Done():
+				if errors.Is(ctx.Err(), context.Canceled) {
+					msg := fmt.Sprintf("\nexiting: %s\n", context.Cause(ctx).Error())
+					os.Stdout.WriteString(msg)
+				}
+			case <-done:
+			}
+
+		},
+	}
+	logTailCmd.Flags().IntVarP(&tailLines, "lines", "n", 10, "Number of historical lines to show on connect")
+
 	logCmd := &cobra.Command{
 		Use:   "log",
 		Short: "Manage runtime debug logs",
@@ -156,6 +286,7 @@ func initLogCmd() *cobra.Command {
 	}
 	logCmd.AddCommand(logSendCmd)
 	logCmd.AddCommand(logViewCmd)
+	logCmd.AddCommand(logTailCmd)
 	rootCmd.AddCommand(logCmd)
 
 	return logCmd
@@ -190,11 +321,52 @@ func initRunCmd() *cobra.Command {
 	_ = runCmd.Flags().MarkHidden("iface")
 	runCmd.Flags().StringVarP(&cdUpstreamProto, "proto", "", ctrld.ResolverTypeDOH, `Control D upstream type, either "doh" or "doh3"`)
 	runCmd.Flags().BoolVarP(&rfc1918, "rfc1918", "", false, "Listen on RFC1918 addresses when 127.0.0.1 is the only listener")
+	runCmd.Flags().StringVarP(&interceptMode, "intercept-mode", "", "", "OS-level DNS interception mode: 'off' (disable interception and clear a persisted intercept_mode), 'dns' (with VPN split routing), or 'hard' (all DNS through ctrld, no VPN split routing)")
 
 	runCmd.FParseErrWhitelist = cobra.FParseErrWhitelist{UnknownFlags: true}
 	rootCmd.AddCommand(runCmd)
 
 	return runCmd
+}
+
+// serviceStageFailureCode maps an aborted service-manager task to its
+// provisioning code. Other abortOnError tasks (like config validation) keep
+// their own error paths.
+func serviceStageFailureCode(taskName string) (provisionFailureCode, bool) {
+	switch taskName {
+	case "Install":
+		return provisionCodeServiceInstall, true
+	case "Start":
+		return provisionCodeServiceStartFailed, true
+	default:
+		return "", false
+	}
+}
+
+// serviceTaskErrorSummary describes which service-manager task failed and why,
+// for use as a provisioning result message.
+func serviceTaskErrorSummary(taskName string, err error) string {
+	return fmt.Sprintf("%s failed: %v", taskName, err)
+}
+
+// resultStalenessTolerance absorbs clock granularity between "ctrld start"
+// recording its start time and the daemon writing its result file.
+const resultStalenessTolerance = 2 * time.Second
+
+// reportStartFailure reports why "ctrld start" failed after install/start
+// looked fine. A result file the daemon wrote during this attempt names the
+// failure better than a generic self-check code, so it wins.
+func reportStartFailure(startedAt time.Time, fallbackMsg string) {
+	if r, err := readProvisionResult(); err == nil && provisionResultTrusted(r) {
+		if ts, err := time.Parse(time.RFC3339, r.Timestamp); err == nil {
+			if !ts.Before(startedAt.Add(-resultStalenessTolerance)) {
+				mainLog.Load().Error().Msg(r.failureLine())
+				provisionExit(r.ExitCode)
+				return
+			}
+		}
+	}
+	failProvision(newProvisionResult(provisionCodeServiceSelfCheck, fallbackMsg, nil, provisionSecrets()...), nil)
 }
 
 func initStartCmd() *cobra.Command {
@@ -216,9 +388,20 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 			return nil
 		},
 		Run: func(cmd *cobra.Command, args []string) {
-			checkStrFlagEmpty(cmd, cdUidFlagName)
-			checkStrFlagEmpty(cmd, cdOrgFlagName)
-			validateCdAndNextDNSFlags()
+			// Clear before any check runs, not just before doTasksE: a result from a
+			// previous attempt must never survive to mislead diag/postinstall on this
+			// one, even if this attempt fails before reaching doTasksE.
+			clearProvisionResult()
+
+			if !checkStrFlagEmpty(cmd, cdUidFlagName) {
+				return
+			}
+			if !checkStrFlagEmpty(cmd, cdOrgFlagName) {
+				return
+			}
+			if !validateCdAndNextDNSFlags() {
+				return
+			}
 			sc := &service.Config{}
 			*sc = *svcConfig
 			osArgs := os.Args[2:]
@@ -229,6 +412,14 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 			setDependencies(sc)
 			sc.Arguments = append([]string{"run"}, osArgs...)
 
+			// Validate --intercept-mode early, before installing the service.
+			// Without this, a typo like "--intercept-mode fds" would install the service,
+			// the child process would Fatal() on the invalid value, and the parent would
+			// then uninstall — confusing and destructive.
+			if !validateInterceptModeFlag(interceptMode) {
+				return
+			}
+
 			p := &prog{
 				router: router.New(&cfg, cdUID != ""),
 				cfg:    &cfg,
@@ -236,6 +427,9 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 			s, err := newService(p, sc)
 			if err != nil {
 				mainLog.Load().Error().Msg(err.Error())
+				// A bare return would exit 0 with no result file, so support
+				// could not tell this failure from a start that never ran.
+				failProvisionUnclassified("initialize service: "+err.Error(), nil)
 				return
 			}
 			p.preRun()
@@ -246,6 +440,53 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 
 			// Get current running iface, if any.
 			var currentIface *ifaceResponse
+
+			// Handle "ctrld start --intercept-mode dns|hard" on an existing
+			// service BEFORE the pin check. Adding intercept mode is an enhancement, not
+			// deactivation, so it doesn't require the deactivation pin. We modify the
+			// plist/registry directly and restart the service via the OS service manager.
+			osArgsEarly := os.Args[2:]
+			if os.Args[1] == "service" {
+				osArgsEarly = os.Args[3:]
+			}
+			osArgsEarly = filterEmptyStrings(osArgsEarly)
+			interceptOnly := onlyInterceptFlags(osArgsEarly)
+			svcExists := serviceConfigFileExists()
+			mainLog.Load().Debug().Msgf("intercept upgrade check: args=%v interceptOnly=%v svcConfigExists=%v interceptMode=%q", osArgsEarly, interceptOnly, svcExists, interceptMode)
+			if interceptOnly && svcExists {
+				// An explicit "off" argument must override a previously persisted config
+				// value while the service clears that value on startup.
+				if err := removeServiceFlag("--intercept-mode"); err != nil {
+					failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to remove existing intercept mode from service arguments: %v", err), nil)
+					return
+				}
+
+				if interceptMode == "off" {
+					mainLog.Load().Notice().Msg("Existing service detected — disabling intercept mode")
+				} else {
+					mainLog.Load().Notice().Msgf("Existing service detected — appending --intercept-mode %s to service arguments", interceptMode)
+				}
+				if err := appendServiceFlag("--intercept-mode"); err != nil {
+					failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to append intercept flag to service arguments: %v", err), nil)
+					return
+				}
+				if err := appendServiceFlag(interceptMode); err != nil {
+					failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to append intercept mode value to service arguments: %v", err), nil)
+					return
+				}
+
+				// Stop the service if running (bypasses ctrld pin — this is an
+				// enhancement, not deactivation). Then fall through to the normal
+				// startOnly path which handles start, self-check, and reporting.
+				if isCtrldRunning {
+					mainLog.Load().Notice().Msg("Stopping service for intercept mode upgrade")
+					_ = s.Stop()
+					isCtrldRunning = false
+				}
+				startOnly = true
+				isCtrldInstalled = true
+				// Fall through to startOnly path below.
+			}
 
 			// If pin code was set, do not allow running start command.
 			if isCtrldRunning {
@@ -262,7 +503,7 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 			reportSetDnsOk := func(sockDir string) {
 				if cc := newSocketControlClient(ctx, s, sockDir); cc != nil {
 					if resp, _ := cc.post(ifacePath, nil); resp != nil && resp.StatusCode == http.StatusOK {
-						if iface == "auto" {
+						if iface == autoIface {
 							iface = defaultIfaceName()
 						}
 						res := &ifaceResponse{}
@@ -271,20 +512,31 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 							return
 						}
 						if res.OK {
-							name := res.Name
-							if iff, err := net.InterfaceByName(name); err == nil {
-								_, _ = patchNetIfaceName(iff)
-								name = iff.Name
-							}
-							logger := mainLog.Load().With().Str("iface", name).Logger()
-							logger.Debug().Msg("setting DNS successfully")
-							if res.All {
-								// Log that DNS is set for other interfaces.
-								withEachPhysicalInterfaces(
-									name,
-									"set DNS",
-									func(i *net.Interface) error { return nil },
-								)
+							// In intercept mode, show intercept-specific status instead of
+							// per-interface DNS messages (which are irrelevant).
+							if res.InterceptMode != "" {
+								switch res.InterceptMode {
+								case "hard":
+									mainLog.Load().Notice().Msg("DNS hard intercept mode active — all DNS traffic intercepted, no VPN split routing")
+								default:
+									mainLog.Load().Notice().Msg("DNS intercept mode active — all DNS traffic intercepted via OS packet filter")
+								}
+							} else {
+								name := res.Name
+								if iff, err := net.InterfaceByName(name); err == nil {
+									_, _ = patchNetIfaceName(iff)
+									name = iff.Name
+								}
+								logger := mainLog.Load().With().Str("iface", name).Logger()
+								logger.Debug().Msg("setting DNS successfully")
+								if res.All {
+									// Log that DNS is set for other interfaces.
+									withEachPhysicalInterfaces(
+										name,
+										"set DNS",
+										func(i *net.Interface) error { return nil },
+									)
+								}
 							}
 						}
 					}
@@ -344,11 +596,13 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 			if !startOnly {
 				startOnly = len(osArgs) == 0
 			}
+
 			// If user run "ctrld start" and ctrld is already installed, starting existing service.
 			if startOnly && isCtrldInstalled {
 				tryReadingConfigWithNotice(false, true)
 				if err := v.Unmarshal(&cfg); err != nil {
-					mainLog.Load().Fatal().Msgf("failed to unmarshal config: %v", err)
+					failRunUnclassified(mainLog.Load().Error(), fmt.Sprintf("failed to unmarshal config: %v", err), nil)
+					return
 				}
 
 				// if already running, dont restart
@@ -375,24 +629,57 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 					{s.Start, true, "Start"},
 					{noticeWritingControlDConfig, false, "Notice writing ControlD config"},
 				}
+				startAttemptAt := time.Now()
 				mainLog.Load().Notice().Msg("Starting existing ctrld service")
-				if doTasks(tasks) {
-					mainLog.Load().Notice().Msg("Service started")
-					sockDir, err := socketDir()
-					if err != nil {
-						mainLog.Load().Warn().Err(err).Msg("Failed to get socket directory")
-						os.Exit(1)
+				failedTask, taskErr := doTasksE(tasks)
+				if taskErr != nil {
+					if code, ok := serviceStageFailureCode(failedTask); ok {
+						failProvision(newProvisionResult(code, serviceTaskErrorSummary(failedTask, taskErr), nil, provisionSecrets()...), nil)
+						return
 					}
-					reportSetDnsOk(sockDir)
-				} else {
-					mainLog.Load().Error().Err(err).Msg("Failed to start existing ctrld service")
-					os.Exit(1)
+					// Not a service-stage task. doTasksE already logged the cause; classify
+					// UNCLASSIFIED instead of the old silent fall-through that exited 1.
+					failProvisionUnclassified(serviceTaskErrorSummary(failedTask, taskErr), nil)
+					return
+				}
+				sockDir, err := socketDir()
+				if err != nil {
+					failRunUnclassified(mainLog.Load().Error(), fmt.Sprintf("failed to get socket directory: %v", err), nil)
+					return
+				}
+
+				// The daemon can start and still fail provisioning (for example a
+				// listener bind conflict). Self-check like a fresh install so this
+				// path reports the daemon's failure code instead of a false
+				// "Service started" — but never uninstall an existing service.
+				time.Sleep(1 * time.Second)
+				ok, status, err := selfCheckStatus(ctx, s, sockDir)
+				if !ok || status != service.StatusRunning {
+					fallbackMsg := "ctrld service did not pass its post-start self-check"
+					if err != nil {
+						fallbackMsg = fmt.Sprintf("An error occurred while performing test query: %s", err)
+						mainLog.Load().Error().Msg(fallbackMsg)
+					}
+					if status == service.StatusRunning && err == nil {
+						fallbackMsg = "ctrld service was running, but a DNS query could not be sent to its listener; check firewall rules blocking/intercepting/redirecting DNS queries"
+						mainLog.Load().Error().Msg(fallbackMsg)
+					}
+					reportStartFailure(startAttemptAt, fallbackMsg)
+					return
+				}
+				mainLog.Load().Notice().Msg("Service started")
+				clearProvisionResult()
+				reportSetDnsOk(sockDir)
+				// Verify service registration after successful start.
+				if err := verifyServiceRegistration(); err != nil {
+					mainLog.Load().Warn().Err(err).Msg("Service registry verification failed")
 				}
 				return
 			}
 
 			if cdUID != "" {
-				_ = doValidateCdRemoteConfig(cdUID, true)
+				// Skip doValidateCdRemoteConfig() here - run command will handle
+				// validation and config fetch via processCDFlags().
 			} else if uid := cdUIDFromProvToken(); uid != "" {
 				cdUID = uid
 				mainLog.Load().Debug().Msg("using uid from provision token")
@@ -401,11 +688,14 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 				sc.Arguments = append(sc.Arguments, "--cd="+cdUID)
 			}
 			if cdUID != "" {
-				validateCdUpstreamProtocol()
+				if !validateCdUpstreamProtocol(nil) {
+					return
+				}
 			}
 
 			if err := p.router.ConfigureService(sc); err != nil {
-				mainLog.Load().Fatal().Err(err).Msg("failed to configure service on router")
+				failRunUnclassified(mainLog.Load().Error().Err(err), fmt.Sprintf("failed to configure service on router: %v", err), nil)
+				return
 			}
 
 			if configPath != "" {
@@ -415,7 +705,8 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 			tryReadingConfigWithNotice(writeDefaultConfig, true)
 
 			if err := v.Unmarshal(&cfg); err != nil {
-				mainLog.Load().Fatal().Msgf("failed to unmarshal config: %v", err)
+				failRunUnclassified(mainLog.Load().Error(), fmt.Sprintf("failed to unmarshal config: %v", err), nil)
+				return
 			}
 
 			initInteractiveLogging()
@@ -451,7 +742,7 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 					})
 					return nil
 				}, false, "Save current DNS"},
-				{s.Install, false, "Install"},
+				{s.Install, true, "Install"},
 				{func() error {
 					return ConfigureWindowsServiceFailureActions(ctrldServiceName)
 				}, false, "Configure Windows service failure actions"},
@@ -460,55 +751,75 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 				// generated after s.Start, so we notice users here for consistent with nextdns mode.
 				{noticeWritingControlDConfig, false, "Notice writing ControlD config"},
 			}
+			startAttemptAt := time.Now()
 			mainLog.Load().Notice().Msg("Starting service")
-			if doTasks(tasks) {
-				if err := p.router.Install(sc); err != nil {
-					mainLog.Load().Warn().Err(err).Msg("post installation failed, please check system/service log for details error")
+			failedTask, taskErr := doTasksE(tasks)
+			if taskErr != nil {
+				if code, ok := serviceStageFailureCode(failedTask); ok {
+					failProvision(newProvisionResult(code, serviceTaskErrorSummary(failedTask, taskErr), nil, provisionSecrets()...), nil)
 					return
 				}
+				// Not a service-stage task. doTasksE already logged the cause; classify
+				// UNCLASSIFIED instead of the old silent fall-through that exited 0.
+				failProvisionUnclassified(serviceTaskErrorSummary(failedTask, taskErr), nil)
+				return
+			}
 
-				// add a small delay to ensure the service is started and did not crash
-				time.Sleep(1 * time.Second)
+			if err := p.router.Install(sc); err != nil {
+				mainLog.Load().Warn().Err(err).Msg("post installation failed, please check system/service log for details error")
+				return
+			}
 
-				ok, status, err := selfCheckStatus(ctx, s, sockDir)
-				switch {
-				case ok && status == service.StatusRunning:
-					mainLog.Load().Notice().Msg("Service started")
-				default:
-					marker := bytes.Repeat([]byte("="), 32)
-					// If ctrld service is not running, emitting log obtained from ctrld process.
-					if status != service.StatusRunning || ctx.Err() != nil {
-						mainLog.Load().Error().Msg("ctrld service may not have started due to an error or misconfiguration, service log:")
-						_, _ = mainLog.Load().Write(marker)
-						haveLog := false
-						for msg := range runCmdLogCh {
-							_, _ = mainLog.Load().Write([]byte(strings.ReplaceAll(msg, msgExit, "")))
-							haveLog = true
-						}
-						// If we're unable to get log from "ctrld run", notice users about it.
-						if !haveLog {
-							mainLog.Load().Write([]byte(`<no log output is obtained from ctrld process>"`))
-						}
-					}
-					// Report any error if occurred.
-					if err != nil {
-						_, _ = mainLog.Load().Write(marker)
-						msg := fmt.Sprintf("An error occurred while performing test query: %s", err)
-						mainLog.Load().Write([]byte(msg))
-					}
-					// If ctrld service is running but selfCheckStatus failed, it could be related
-					// to user's system firewall configuration, notice users about it.
-					if status == service.StatusRunning && err == nil {
-						_, _ = mainLog.Load().Write(marker)
-						mainLog.Load().Write([]byte(`ctrld service was running, but a DNS query could not be sent to its listener`))
-						mainLog.Load().Write([]byte(`Please check your system firewall if it is configured to block/intercept/redirect DNS queries`))
-					}
+			// add a small delay to ensure the service is started and did not crash
+			time.Sleep(1 * time.Second)
 
+			ok, status, err := selfCheckStatus(ctx, s, sockDir)
+			switch {
+			case ok && status == service.StatusRunning:
+				mainLog.Load().Notice().Msg("Service started")
+				clearProvisionResult()
+			default:
+				marker := bytes.Repeat([]byte("="), 32)
+				fallbackMsg := "ctrld service did not pass its post-start self-check"
+				// If ctrld service is not running, emitting log obtained from ctrld process.
+				if status != service.StatusRunning || ctx.Err() != nil {
+					mainLog.Load().Error().Msg("ctrld service may not have started due to an error or misconfiguration, service log:")
 					_, _ = mainLog.Load().Write(marker)
-					uninstall(p, s)
-					os.Exit(1)
+					haveLog := false
+					for msg := range runCmdLogCh {
+						_, _ = mainLog.Load().Write([]byte(strings.ReplaceAll(msg, msgExit, "")))
+						haveLog = true
+					}
+					// If we're unable to get log from "ctrld run", notice users about it.
+					if !haveLog {
+						mainLog.Load().Write([]byte(`<no log output is obtained from ctrld process>"`))
+					}
 				}
-				reportSetDnsOk(sockDir)
+				// Report any error if occurred.
+				if err != nil {
+					_, _ = mainLog.Load().Write(marker)
+					msg := fmt.Sprintf("An error occurred while performing test query: %s", err)
+					mainLog.Load().Write([]byte(msg))
+					fallbackMsg = msg
+				}
+				// If ctrld service is running but selfCheckStatus failed, it could be related
+				// to user's system firewall configuration, notice users about it.
+				if status == service.StatusRunning && err == nil {
+					_, _ = mainLog.Load().Write(marker)
+					mainLog.Load().Write([]byte(`ctrld service was running, but a DNS query could not be sent to its listener`))
+					mainLog.Load().Write([]byte(`Please check your system firewall if it is configured to block/intercept/redirect DNS queries`))
+					fallbackMsg = "ctrld service was running, but a DNS query could not be sent to its listener; check firewall rules blocking/intercepting/redirecting DNS queries"
+				}
+
+				_, _ = mainLog.Load().Write(marker)
+				uninstall(p, s)
+				reportStartFailure(startAttemptAt, fallbackMsg)
+				return
+			}
+			reportSetDnsOk(sockDir)
+			// Verify service registration after successful start.
+			if err := verifyServiceRegistration(); err != nil {
+				mainLog.Load().Warn().Err(err).Msg("Service registry verification failed")
 			}
 		},
 	}
@@ -533,6 +844,7 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 	startCmd.Flags().BoolVarP(&startOnly, "start_only", "", false, "Do not install new service")
 	_ = startCmd.Flags().MarkHidden("start_only")
 	startCmd.Flags().BoolVarP(&rfc1918, "rfc1918", "", false, "Listen on RFC1918 addresses when 127.0.0.1 is the only listener")
+	startCmd.Flags().StringVarP(&interceptMode, "intercept-mode", "", "", "OS-level DNS interception mode: 'off' (disable interception and clear a persisted intercept_mode), 'dns' (with VPN split routing), or 'hard' (all DNS through ctrld, no VPN split routing)")
 
 	routerCmd := &cobra.Command{
 		Use: "setup",
@@ -589,7 +901,7 @@ NOTE: running "ctrld start" without any arguments will start already installed c
 			startCmd.Run(cmd, args)
 		},
 	}
-	startCmdAlias.Flags().StringVarP(&ifaceStartStop, "iface", "", "auto", `Update DNS setting for iface, "auto" means the default interface gateway`)
+	startCmdAlias.Flags().StringVarP(&ifaceStartStop, "iface", "", autoIface, `Update DNS setting for iface, "auto" means the default interface gateway`)
 	startCmdAlias.Flags().AddFlagSet(startCmd.Flags())
 	rootCmd.AddCommand(startCmdAlias)
 
@@ -674,7 +986,7 @@ func initStopCmd() *cobra.Command {
 			stopCmd.Run(cmd, args)
 		},
 	}
-	stopCmdAlias.Flags().StringVarP(&ifaceStartStop, "iface", "", "auto", `Reset DNS setting for iface, "auto" means the default interface gateway`)
+	stopCmdAlias.Flags().StringVarP(&ifaceStartStop, "iface", "", autoIface, `Reset DNS setting for iface, "auto" means the default interface gateway`)
 	stopCmdAlias.Flags().AddFlagSet(stopCmd.Flags())
 	rootCmd.AddCommand(stopCmdAlias)
 
@@ -706,7 +1018,7 @@ func initRestartCmd() *cobra.Command {
 				return
 			}
 			if iface == "" {
-				iface = "auto"
+				iface = autoIface
 			}
 			p.preRun()
 			if ir := runningIface(s); ir != nil {
@@ -888,6 +1200,7 @@ func initStatusCmd() *cobra.Command {
 	statusCmd := &cobra.Command{
 		Use:   "status",
 		Short: "Show status of the ctrld service",
+		Long:  statusCmdLong,
 		Args:  cobra.NoArgs,
 		Run: func(cmd *cobra.Command, args []string) {
 			s, err := newService(&prog{}, svcConfig)
@@ -903,13 +1216,25 @@ func initStatusCmd() *cobra.Command {
 			switch status {
 			case service.StatusUnknown:
 				mainLog.Load().Notice().Msg("Unknown status")
-				os.Exit(2)
+				os.Exit(statusExitUnknown)
 			case service.StatusRunning:
-				mainLog.Load().Notice().Msg("Service is running")
-				os.Exit(0)
+				// The service manager only knows a process was created. It reports a
+				// service as running even when the process is still in startup, with
+				// no control socket, no DNS listener and no policy applied - so
+				// "Service is running" can describe a host with no working DNS.
+				// Probe readiness before claiming it.
+				ready, probeErr := serviceReady()
+				if probeErr != nil {
+					mainLog.Load().Debug().Err(probeErr).Msg("Readiness probe did not confirm startup")
+				}
+				r := classifyReadiness(ready, probeErr, readinessVerifiable())
+				for _, msg := range r.messages {
+					mainLog.Load().Notice().Msg(msg)
+				}
+				os.Exit(r.exitCode)
 			case service.StatusStopped:
 				mainLog.Load().Notice().Msg("Service is stopped")
-				os.Exit(1)
+				os.Exit(statusExitStopped)
 			}
 		},
 	}
@@ -923,6 +1248,7 @@ func initStatusCmd() *cobra.Command {
 	statusCmdAlias := &cobra.Command{
 		Use:   "status",
 		Short: "Show status of the ctrld service",
+		Long:  statusCmdLong,
 		Args:  cobra.NoArgs,
 		Run:   statusCmd.Run,
 	}
@@ -952,7 +1278,7 @@ NOTE: Uninstalling will set DNS to values provided by DHCP.`,
 				return
 			}
 			if iface == "" {
-				iface = "auto"
+				iface = autoIface
 			}
 			p.preRun()
 			if ir := runningIface(s); ir != nil {
@@ -967,14 +1293,16 @@ NOTE: Uninstalling will set DNS to values provided by DHCP.`,
 				var files []string
 				// Config file.
 				files = append(files, v.ConfigFileUsed())
-				// Log file and backup log file.
-				// For safety, only process if log file path is absolute.
-				if logFile := normalizeLogFilePath(cfg.Service.LogPath); filepath.IsAbs(logFile) {
-					files = append(files, logFile)
-					oldLogFile := logFile + oldLogSuffix
-					if _, err := os.Stat(oldLogFile); err == nil {
-						files = append(files, oldLogFile)
-					}
+				// Log files. For safety, only remove the log_path chain if
+				// that path is absolute.
+				logFile := normalizeLogFilePath(cfg.Service.LogPath)
+				if !filepath.IsAbs(logFile) {
+					logFile = ""
+				}
+				backups := debugLogBudget(&cfg.Service, router.Name() != "").backups
+				internalLogs := []string{absHomeDir(logFileName), absHomeDir(journalLogFileName)}
+				for _, err := range removeLogFiles(logFile, backups, internalLogs) {
+					mainLog.Load().Warn().Err(err).Msg("failed to remove log file")
 				}
 				// Socket files.
 				if dir, _ := socketDir(); dir != "" {
@@ -1048,7 +1376,7 @@ NOTE: Uninstalling will set DNS to values provided by DHCP.`,
 			uninstallCmd.Run(cmd, args)
 		},
 	}
-	uninstallCmdAlias.Flags().StringVarP(&ifaceStartStop, "iface", "", "auto", `Reset DNS setting for iface, "auto" means the default interface gateway`)
+	uninstallCmdAlias.Flags().StringVarP(&ifaceStartStop, "iface", "", autoIface, `Reset DNS setting for iface, "auto" means the default interface gateway`)
 	uninstallCmdAlias.Flags().AddFlagSet(uninstallCmd.Flags())
 	rootCmd.AddCommand(uninstallCmdAlias)
 
@@ -1241,7 +1569,7 @@ func initUpgradeCmd() *cobra.Command {
 				return
 			}
 			if iface == "" {
-				iface = "auto"
+				iface = autoIface
 			}
 			p.preRun()
 			if ir := runningIface(s); ir != nil {
@@ -1342,28 +1670,31 @@ func initUpgradeCmd() *cobra.Command {
 			if doRestart() {
 				_ = os.Remove(oldBin)
 				_ = os.Chmod(bin, 0755)
-				ver := "unknown version"
-				out, err := exec.Command(bin, "--version").CombinedOutput()
+				ver, err := binaryVersion(bin)
 				if err != nil {
 					mainLog.Load().Warn().Err(err).Msg("Failed to get new binary version")
-				}
-				if after, found := strings.CutPrefix(string(out), "ctrld version "); found {
-					ver = after
+					ver = "unknown version"
 				}
 				mainLog.Load().Notice().Msgf("Upgrade successful - %s", ver)
 				return
 			}
 
-			mainLog.Load().Warn().Msgf("Upgrade failed, restoring previous binary: %s", oldBin)
-			if err := os.Remove(bin); err != nil {
-				mainLog.Load().Fatal().Err(err).Msg("failed to remove new binary")
+			mainLog.Load().Warn().Msg("Upgrade failed: the new binary did not become ready")
+			stop := func() error {
+				if !svcInstalled {
+					return nil
+				}
+				if err := stopServiceAndWait(s, upgradeStopTimeout); err != nil {
+					return err
+				}
+				// Mirror the Cleanup task in doRestart: leave DNS settings as the OS
+				// had them, not as a half-started ctrld left them.
+				p.router.Cleanup()
+				p.resetDNS(false, true)
+				return nil
 			}
-			if err := os.Rename(oldBin, bin); err != nil {
-				mainLog.Load().Fatal().Err(err).Msg("failed to restore old binary")
-			}
-			if doRestart() {
-				mainLog.Load().Notice().Msg("Restored previous binary successfully")
-				return
+			if err := rollbackToPreviousBinary(bin, oldBin, stop, doRestart); err != nil {
+				mainLog.Load().Error().Err(err).Msg("Rollback did not complete")
 			}
 		},
 	}
@@ -1394,4 +1725,54 @@ func filterEmptyStrings(slice []string) []string {
 	return slices.DeleteFunc(slice, func(s string) bool {
 		return s == ""
 	})
+}
+
+// validInterceptMode reports whether the given value is a recognized --intercept-mode.
+// This is the single source of truth for mode validation — used by the early start
+// command check, the runtime validation in prog.go, and onlyInterceptFlags below.
+// Add new modes here to have them recognized everywhere.
+func validInterceptMode(mode string) bool {
+	switch mode {
+	case "off", "dns", "hard":
+		return true
+	}
+	return false
+}
+
+// onlyInterceptFlags reports whether args contain only intercept mode
+// flags (--intercept-mode <value>) and flags that are auto-added by the
+// start command alias (--iface). This is used to detect "ctrld start --intercept-mode dns"
+// (or "off" to disable) on an existing installation, where the intent is to modify the
+// intercept flag on the existing service without replacing other arguments.
+//
+// Note: the startCmdAlias appends "--iface=auto" to os.Args when --iface isn't
+// explicitly provided, so we must allow it here.
+func onlyInterceptFlags(args []string) bool {
+	hasIntercept := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		switch {
+		case arg == "--intercept-mode":
+			// Next arg must be a valid mode value.
+			if i+1 < len(args) && validInterceptMode(args[i+1]) {
+				hasIntercept = true
+				i++ // skip the value
+			} else {
+				return false
+			}
+		case strings.HasPrefix(arg, "--intercept-mode="):
+			val := strings.TrimPrefix(arg, "--intercept-mode=")
+			if validInterceptMode(val) {
+				hasIntercept = true
+			} else {
+				return false
+			}
+		case arg == "--iface="+autoIface || arg == "--iface" || arg == autoIface:
+			// Auto-added by startCmdAlias or its value; safe to ignore.
+			continue
+		default:
+			return false
+		}
+	}
+	return hasIntercept
 }

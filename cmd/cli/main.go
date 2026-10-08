@@ -2,6 +2,7 @@ package cli
 
 import (
 	"io"
+	"net"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -40,6 +41,9 @@ var (
 	cleanup           bool
 	startOnly         bool
 	rfc1918           bool
+	interceptMode     string // "", "off", "dns", or "hard" — set via --intercept-mode flag or config
+	dnsIntercept      bool   // derived: interceptMode == "dns" || interceptMode == "hard"
+	hardIntercept     bool   // derived: interceptMode == "hard"
 
 	mainLog       atomic.Pointer[zerolog.Logger]
 	consoleWriter zerolog.ConsoleWriter
@@ -51,6 +55,9 @@ const (
 	cdOrgFlagName          = "cd-org"
 	customHostnameFlagName = "custom-hostname"
 	nextdnsFlagName        = "nextdns"
+
+	// autoIface is the sentinel --iface value meaning "use the default gateway interface".
+	autoIface = "auto"
 )
 
 func init() {
@@ -59,6 +66,16 @@ func init() {
 }
 
 func Main() {
+	// Fast path for pf interception probe subprocess. This runs before cobra
+	// initialization to minimize startup time. The parent process spawns us with
+	// "pf-probe-send <host> <hex-dns-packet>" and a non-_ctrld GID so pf
+	// intercepts the DNS query. If pf rdr is working, the query reaches ctrld's
+	// listener; if not, it goes to the real DNS server and ctrld detects the miss.
+	if len(os.Args) >= 4 && os.Args[1] == "pf-probe-send" {
+		pfProbeSend(os.Args[2], os.Args[3])
+		return
+	}
+
 	ctrld.InitConfig(v, "ctrld")
 	initCLI()
 	if err := rootCmd.Execute(); err != nil {
@@ -126,30 +143,8 @@ func initInteractiveLogging() {
 // wrapper instead of calling this function directly.
 func initLoggingWithBackup(doBackup bool) []io.Writer {
 	var writers []io.Writer
-	if logFilePath := normalizeLogFilePath(cfg.Service.LogPath); logFilePath != "" {
-		// Create parent directory if necessary.
-		if err := os.MkdirAll(filepath.Dir(logFilePath), 0750); err != nil {
-			mainLog.Load().Error().Msgf("failed to create log path: %v", err)
-			os.Exit(1)
-		}
-
-		// Default open log file in append mode.
-		flags := os.O_CREATE | os.O_RDWR | os.O_APPEND
-		if doBackup {
-			// Backup old log file with .1 suffix.
-			if err := os.Rename(logFilePath, logFilePath+oldLogSuffix); err != nil && !os.IsNotExist(err) {
-				mainLog.Load().Error().Msgf("could not backup old log file: %v", err)
-			} else {
-				// Backup was created, set flags for truncating old log file.
-				flags = os.O_CREATE | os.O_RDWR
-			}
-		}
-		logFile, err := openLogFile(logFilePath, flags)
-		if err != nil {
-			mainLog.Load().Error().Msgf("failed to create log file: %v", err)
-			os.Exit(1)
-		}
-		writers = append(writers, logFile)
+	if rf := openLogPathWriter(doBackup); rf != nil {
+		writers = append(writers, rf)
 	}
 	writers = append(writers, consoleWriter)
 	multi := zerolog.MultiLevelWriter(writers...)
@@ -187,5 +182,16 @@ func initCache() {
 	}
 	if cfg.Service.CacheSize == 0 {
 		cfg.Service.CacheSize = 4096
+	}
+}
+
+// pfProbeSend is a minimal subprocess that sends a pre-built DNS query packet
+// to the specified host on port 53. It's invoked by probePFIntercept() with a
+// non-_ctrld GID so pf interception applies to the query.
+//
+// Usage: ctrld pf-probe-send <host> <hex-encoded-dns-packet>
+func pfProbeSend(host, hexPacket string) {
+	if err := sendPFProbe(host, hexPacket, net.DialTimeout, os.Stdout); err != nil {
+		os.Exit(1)
 	}
 }

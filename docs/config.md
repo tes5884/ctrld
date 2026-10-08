@@ -121,9 +121,27 @@ Logging level you wish to enable.
 ### log_path
 Relative or absolute path of the log file. 
 
+Point `log_path` at a file that no other program rotates. ctrld renames `<log_path>.1` to `<log_path>.N` and uploads these files. A lower `log_max_backups` leaves the older numbered `log_path` files in place, but ctrld removes the extra numbered files of its internal logs.
+
 - Type: string
 - Required: no
 - Default: ""
+
+### log_max_size_mb
+Maximum size of the debug log file in MB. When the file reaches this size, ctrld rotates it. This limit also applies to the `log_path` file.
+
+- Type: integer
+- Required: no
+- Valid values: 1 to 1024
+- Default: 10 on desktop platforms, 5 on routers
+
+### log_max_backups
+Number of rotated debug log files that ctrld keeps. If the value is 0, ctrld keeps no rotated file. This number also applies to the `log_path` file.
+
+- Type: integer
+- Required: no
+- Valid values: 0 to 64
+- Default: 4 on desktop platforms, 1 on routers
 
 ### cache_enable
 When `cache_enable = true`, all resolved DNS query responses will be cached for duration of the upstream record TTLs.
@@ -294,6 +312,22 @@ If a remote upstream fails to resolve a query or is unreachable, `ctrld` will fo
 - Type: boolean
 - Required: no
 - Default: true on Windows, MacOS and non-router Linux.
+
+### nrpt_recovery_max_attempts
+Windows DNS intercept mode uses NRPT health probes and recovery when Windows stops routing queries to the local `ctrld` listener. This limits how many consecutive recovery flows can run before `ctrld` enters a cooldown and stops making policy/Dnscache changes.
+
+Set to `0` to disable this circuit breaker and keep retrying indefinitely.
+
+- Type: integer
+- Required: no
+- Default: 0 (unlimited, current behavior)
+
+### nrpt_recovery_cooldown
+Cooldown duration after `nrpt_recovery_max_attempts` consecutive Windows NRPT recovery flows. During cooldown, `ctrld` logs the suppressed recovery and avoids additional `RefreshPolicyEx`, Dnscache `paramchange`, and DNS cache flush calls.
+
+- Type: time duration string
+- Required: no
+- Default: 30m
 
 ## Upstream
 The `[upstream]` section specifies the DNS upstream servers that `ctrld` will forward DNS requests to.

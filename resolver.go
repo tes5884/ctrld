@@ -19,6 +19,9 @@ import (
 	"golang.org/x/sync/singleflight"
 	"tailscale.com/net/netmon"
 	"tailscale.com/net/tsaddr"
+
+	"github.com/Control-D-Inc/ctrld/internal/dnscache"
+	ctrldnet "github.com/Control-D-Inc/ctrld/internal/net"
 )
 
 const (
@@ -45,7 +48,11 @@ const (
 
 const controldPublicDns = "76.76.2.0"
 
+const maxConcurrentOSResolverExchanges = 128
+
 var controldPublicDnsWithPort = net.JoinHostPort(controldPublicDns, "53")
+
+var osResolverExchangeSem = make(chan struct{}, maxConcurrentOSResolverExchanges)
 
 var localResolver Resolver
 
@@ -58,11 +65,63 @@ func init() {
 }
 
 var (
-	resolverMutex    sync.Mutex
-	or               *osResolver
+	resolverMutex sync.Mutex
+	or            *osResolver
+	// osResolverPtr holds the same resolver as or, for readers alone. An
+	// initialization holds resolverMutex across a scutil read of several
+	// seconds, and a log header render must not wait for it.
+	osResolverPtr    atomic.Pointer[osResolver]
 	defaultLocalIPv4 atomic.Value // holds net.IP (IPv4)
 	defaultLocalIPv6 atomic.Value // holds net.IP (IPv6)
 )
+
+// storeOsResolver keeps the resolver of the process and the copy that readers
+// take. The caller holds resolverMutex.
+func storeOsResolver(resolver *osResolver) {
+	or = resolver
+	osResolverPtr.Store(resolver)
+}
+
+// NameserversFn reads the nameservers of the system. A test of this package
+// or of a package that drives the OS resolver replaces it to stay off the host.
+var NameserversFn = nameservers
+
+// osResolverReasonUnspecified marks a resolver read that no caller explained.
+const osResolverReasonUnspecified = "unspecified"
+
+// nameserverReads remembers the last nameserver list of one read. The system
+// reports the same list many times, and only a change is news.
+type nameserverReads struct {
+	seen    bool
+	last    []string
+	repeats int
+}
+
+// record stores a new read. It reports whether the list changed, how many
+// reads repeated the list before it, and the list that this read replaces.
+func (n *nameserverReads) record(list []string) (changed bool, repeats int, before []string) {
+	if n.seen && slices.Equal(n.last, list) {
+		n.repeats++
+		return false, n.repeats, n.last
+	}
+	before, repeats = n.last, n.repeats
+	n.seen = true
+	n.last = slices.Clone(list)
+	n.repeats = 0
+	return true, repeats, before
+}
+
+// osResolverLogState keeps the last nameserver reads and the reason of the
+// initialization that runs. The read sits deep in the call chain, so the
+// reason cannot travel as a parameter.
+type osResolverLogState struct {
+	mu     sync.Mutex
+	system nameserverReads
+	final  nameserverReads
+	reason string
+}
+
+var osResolverLog = osResolverLogState{reason: osResolverReasonUnspecified}
 
 func newLocalResolver() Resolver {
 	var nss []string
@@ -78,6 +137,29 @@ type LanQueryCtxKey struct{}
 // LanQueryCtx returns a context.Context with LanQueryCtxKey set.
 func LanQueryCtx(ctx context.Context) context.Context {
 	return context.WithValue(ctx, LanQueryCtxKey{}, true)
+}
+
+// LanOnlyQueryCtxKey is the context.Context key that limits an OS resolver
+// query to its LAN nameservers.
+type LanOnlyQueryCtxKey struct{}
+
+// LanOnlyQueryCtx returns a context.Context with LanOnlyQueryCtxKey set.
+//
+// An OS resolver query made with it goes only to LAN-classified nameservers:
+// private, loopback, link-local and CGNAT addresses. Every public nameserver
+// is left out, the ones DHCP or a VPN supplied as well as ctrld's own public
+// fallback, and with no LAN nameserver the query fails without being sent. It
+// is for names that must not reach public DNS, such as an organization's
+// Internal Domains. LanQueryCtx, by contrast, only drops ctrld's own public
+// fallback.
+func LanOnlyQueryCtx(ctx context.Context) context.Context {
+	return context.WithValue(ctx, LanOnlyQueryCtxKey{}, true)
+}
+
+// isLanOnlyQuery reports whether ctx was made by LanOnlyQueryCtx.
+func isLanOnlyQuery(ctx context.Context) bool {
+	lanOnly, _ := ctx.Value(LanOnlyQueryCtxKey{}).(bool)
+	return lanOnly
 }
 
 // defaultNameservers is like nameservers with each element formed "ip:53".
@@ -110,9 +192,8 @@ func availableNameservers() []string {
 			"Added local IP to OS resolverexclusion map: %s", ipStr)
 	}
 
-	systemNameservers := nameservers()
-	Log(context.Background(), logger.Debug(),
-		"Got system nameservers: %v", systemNameservers)
+	systemNameservers := NameserversFn()
+	logSystemNameservers(systemNameservers)
 
 	for _, ns := range systemNameservers {
 		if _, ok := machineIPsMap[ns]; ok {
@@ -125,9 +206,73 @@ func availableNameservers() []string {
 			"Added non-local nameserver: %s", ns)
 	}
 
-	Log(context.Background(), logger.Debug(),
-		"Final available nameservers: %v", nss)
+	logFinalNameservers(nss)
 	return nss
+}
+
+// logSystemNameservers logs the system read at debug level on change only.
+func logSystemNameservers(list []string) {
+	osResolverLog.mu.Lock()
+	changed, repeats, _ := osResolverLog.system.record(list)
+	osResolverLog.mu.Unlock()
+	if !changed {
+		return
+	}
+	logger := *ProxyLogger.Load()
+	Log(context.Background(), logger.Debug().Int("repeats", repeats),
+		"Got system nameservers: %v", list)
+}
+
+// logFinalNameservers logs the effective read at debug level on change only,
+// and sends each change to the journal, where an outage report needs it.
+func logFinalNameservers(list []string) {
+	osResolverLog.mu.Lock()
+	changed, repeats, before := osResolverLog.final.record(list)
+	reason := osResolverLog.reason
+	osResolverLog.mu.Unlock()
+	if !changed {
+		return
+	}
+	logger := *ProxyLogger.Load()
+	Log(context.Background(), logger.Debug().Int("repeats", repeats),
+		"Final available nameservers: %v", list)
+	Journal(logger.Info()).
+		Str("source", osResolverSource()).
+		Strs("before", before).
+		Strs("after", list).
+		Str("default_route", defaultRouteInterfaceName()).
+		Str("reason", reason).
+		Msg("OS resolver set changed")
+}
+
+// osResolverSource names the place where the platform holds the nameservers.
+func osResolverSource() string {
+	switch runtime.GOOS {
+	case "darwin":
+		return "scutil"
+	case "windows":
+		return "dhcp"
+	case "linux", "dragonfly", "freebsd", "netbsd", "openbsd":
+		return "resolv.conf"
+	}
+	return "unknown"
+}
+
+// defaultRouteInterfaceName returns the interface of the default route, and an
+// empty string when the route table does not answer.
+func defaultRouteInterfaceName() string {
+	name, err := netmon.DefaultRouteInterface()
+	if err != nil {
+		return ""
+	}
+	return name
+}
+
+// setOsResolverReason keeps the reason of the initialization that runs.
+func setOsResolverReason(reason string) {
+	osResolverLog.mu.Lock()
+	defer osResolverLog.mu.Unlock()
+	osResolverLog.reason = reason
 }
 
 // InitializeOsResolver initializes OS resolver using the current system DNS settings.
@@ -136,16 +281,54 @@ func availableNameservers() []string {
 // It's the caller's responsibility to ensure the system DNS is in a clean state before
 // calling this function.
 func InitializeOsResolver(guardAgainstNoNameservers bool) []string {
-	nameservers := availableNameservers()
-	// if no nameservers, return empty slice so we dont remove all nameservers
-	if len(nameservers) == 0 && guardAgainstNoNameservers {
-		return []string{}
-	}
-	ns := initializeOsResolver(nameservers)
+	return InitializeOsResolverWithReason(guardAgainstNoNameservers, osResolverReasonUnspecified)
+}
+
+// InitializeOsResolverWithReason is InitializeOsResolver with the reason that
+// the journal reports when the resolver set changes.
+func InitializeOsResolverWithReason(guardAgainstNoNameservers bool, reason string) []string {
+	effective, _ := InitializeOsResolverWithSystemNameserversReason(guardAgainstNoNameservers, reason)
+	return effective
+}
+
+// InitializeOsResolverWithSystemNameservers initializes the OS resolver and
+// returns both the effective resolver list and the unmodified nameservers
+// discovered from the system. The latter deliberately excludes synthetic
+// fallbacks added by initializeOsResolver.
+func InitializeOsResolverWithSystemNameservers(guardAgainstNoNameservers bool) (effective, system []string) {
+	return InitializeOsResolverWithSystemNameserversReason(guardAgainstNoNameservers, osResolverReasonUnspecified)
+}
+
+// InitializeOsResolverWithSystemNameserversReason is
+// InitializeOsResolverWithSystemNameservers with the reason that the journal
+// reports when the resolver set changes.
+func InitializeOsResolverWithSystemNameserversReason(guardAgainstNoNameservers bool, reason string) (effective, system []string) {
 	resolverMutex.Lock()
 	defer resolverMutex.Unlock()
-	or = newResolverWithNameserver(ns)
-	return ns
+
+	setOsResolverReason(reason)
+	defer setOsResolverReason(osResolverReasonUnspecified)
+
+	system = availableNameservers()
+	if system == nil {
+		// A non-nil empty slice means discovery completed and found no DNS.
+		// Callers use nil to mean that discovery was not attempted.
+		system = []string{}
+	}
+	effective, system, skip := osResolverNameserverSets(system, guardAgainstNoNameservers)
+	if skip {
+		return effective, system
+	}
+	storeOsResolver(newResolverWithNameserver(effective))
+	return effective, system
+}
+
+func osResolverNameserverSets(system []string, guardAgainstNoNameservers bool) (effective, discovered []string, skip bool) {
+	// if no nameservers, return empty slice so we dont remove all nameservers
+	if len(system) == 0 && guardAgainstNoNameservers {
+		return []string{}, system, true
+	}
+	return initializeOsResolver(system), system, false
 }
 
 // initializeOsResolver performs logic for choosing OS resolver nameserver.
@@ -201,7 +384,7 @@ func NewResolver(uc *UpstreamConfig) (Resolver, error) {
 		resolverMutex.Lock()
 		if or == nil {
 			ProxyLogger.Load().Debug().Msgf("Initialize new OS resolver")
-			or = newResolverWithNameserver(defaultNameservers())
+			storeOsResolver(newResolverWithNameserver(defaultNameservers()))
 		}
 		resolverMutex.Unlock()
 		return or, nil
@@ -220,6 +403,10 @@ type osResolver struct {
 	publicServers atomic.Pointer[[]string]
 	group         *singleflight.Group
 	cache         *sync.Map
+	// Per-resolver seams let tests exercise the production Resolve path without
+	// mutating process-wide resolver state.
+	exchangeDNS dnsExchangeFunc
+	localIP     func(string) net.IP
 }
 
 type osResolverResult struct {
@@ -232,6 +419,79 @@ type osResolverResult struct {
 type publicResponse struct {
 	answer *dns.Msg
 	server string
+}
+
+// OsResolverNameservers returns the current OS resolver nameservers (host:port format).
+// Returns nil if the OS resolver has not been initialized.
+// The read takes no lock, so a log header render never waits for a resolver
+// initialization.
+func OsResolverNameservers() []string {
+	r := osResolverPtr.Load()
+	if r == nil {
+		return nil
+	}
+	var nss []string
+	if lan := r.lanServers.Load(); lan != nil {
+		nss = append(nss, *lan...)
+	}
+	if pub := r.publicServers.Load(); pub != nil {
+		nss = append(nss, *pub...)
+	}
+	return nss
+}
+
+// AppendOsResolverNameservers adds additional nameservers to the existing OS resolver
+// without reinitializing it. This is used for late-arriving nameservers such as AD
+// domain controller IPs discovered via background retry.
+// Returns true if nameservers were actually added.
+func AppendOsResolverNameservers(servers []string) bool {
+	if len(servers) == 0 {
+		return false
+	}
+	resolverMutex.Lock()
+	defer resolverMutex.Unlock()
+	if or == nil {
+		return false
+	}
+
+	// Collect existing nameservers to avoid duplicates.
+	existing := make(map[string]bool)
+	if lan := or.lanServers.Load(); lan != nil {
+		for _, s := range *lan {
+			existing[s] = true
+		}
+	}
+	if pub := or.publicServers.Load(); pub != nil {
+		for _, s := range *pub {
+			existing[s] = true
+		}
+	}
+
+	var added bool
+	for _, s := range servers {
+		// Normalize to host:port format.
+		if _, _, err := net.SplitHostPort(s); err != nil {
+			s = net.JoinHostPort(s, "53")
+		}
+		if existing[s] {
+			continue
+		}
+		existing[s] = true
+		added = true
+
+		ip, _, _ := net.SplitHostPort(s)
+		addr, _ := netip.ParseAddr(ip)
+		if isLanAddr(addr) {
+			lan := or.lanServers.Load()
+			newLan := append(append([]string{}, (*lan)...), s)
+			or.lanServers.Store(&newLan)
+		} else {
+			pub := or.publicServers.Load()
+			newPub := append(append([]string{}, (*pub)...), s)
+			or.publicServers.Store(&newPub)
+		}
+	}
+	return added
 }
 
 // SetDefaultLocalIPv4 updates the stored local IPv4.
@@ -262,19 +522,68 @@ func GetDefaultLocalIPv6() net.IP {
 	return nil
 }
 
-// customDNSExchange wraps the DNS exchange to use our debug dialer.
-// It uses dns.ExchangeWithConn so that our custom dialer is used directly.
-func customDNSExchange(ctx context.Context, msg *dns.Msg, server string, desiredLocalIP net.IP) (*dns.Msg, time.Duration, error) {
+type dnsExchangeFunc func(context.Context, *dns.Msg, string, net.IP) (*dns.Msg, time.Duration, error)
+
+func exchangeDNS(ctx context.Context, msg *dns.Msg, server string, localIP net.IP) (*dns.Msg, time.Duration, error) {
 	baseDialer := &net.Dialer{
 		Timeout:  3 * time.Second,
 		Resolver: &net.Resolver{PreferGo: true},
 	}
-	if desiredLocalIP != nil {
-		baseDialer.LocalAddr = &net.UDPAddr{IP: desiredLocalIP, Port: 0}
+	if localIP != nil {
+		baseDialer.LocalAddr = &net.UDPAddr{IP: localIP, Port: 0}
 	}
 	dnsClient := &dns.Client{Net: "udp"}
 	dnsClient.Dialer = baseDialer
 	return dnsClient.ExchangeContext(ctx, msg, server)
+}
+
+func defaultLocalIPForServer(server string) net.IP {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	host, _, err := net.SplitHostPort(server)
+	if err != nil {
+		return nil
+	}
+	addr, err := netip.ParseAddr(host)
+	if err == nil && addr.Zone() != "" {
+		// Scoped resolvers select their interface via the destination zone.
+		// A cached default-interface source can have the wrong family or scope.
+		return nil
+	}
+	if err == nil && addr.Is6() && !addr.Is4In6() {
+		return GetDefaultLocalIPv6()
+	}
+	return GetDefaultLocalIPv4()
+}
+
+func preSendUnreachable(err error) bool {
+	var opErr *net.OpError
+	if !errors.As(err, &opErr) || (opErr.Op != "dial" && opErr.Op != "write") {
+		return false
+	}
+	return ctrldnet.IsUnreachable(err)
+}
+
+// customDNSExchangeWith preserves the preferred source first. A route-selected
+// retry is allowed only when the caller knows the server is an OS-selected resolver,
+// not ctrld's synthetic public fallback. This includes public DNS pushed by a VPN:
+// unbinding changes the source route, not the recipient.
+func customDNSExchangeWith(ctx context.Context, msg *dns.Msg, server string, desiredLocalIP net.IP, allowRouteSelectedRetry bool, exchange dnsExchangeFunc) (*dns.Msg, time.Duration, error) {
+	answer, rtt, err := exchange(ctx, msg, server, desiredLocalIP)
+	if answer != nil || err == nil || ctx.Err() != nil || desiredLocalIP == nil || !allowRouteSelectedRetry || !preSendUnreachable(err) {
+		return answer, rtt, err
+	}
+
+	Log(ctx, ProxyLogger.Load().Debug(), "OS resolver source binding is unreachable; retrying with route-selected source")
+	return exchange(ctx, msg.Copy(), server, nil)
+}
+
+// allowRouteSelectedRetryForOSServer excludes only ctrld's synthetic public
+// fallback. System-provided resolvers remain eligible even when their addresses
+// are public, as with VPNs that push public DNS servers.
+func allowRouteSelectedRetryForOSServer(server string) bool {
+	return server != controldPublicDnsWithPort
 }
 
 const hotCacheTTL = time.Second
@@ -291,14 +600,25 @@ const hotCacheTTL = time.Second
 // for a short period (currently 1 second), reducing unnecessary traffics
 // sent to upstreams.
 func (o *osResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	if err := validateMsg(msg); err != nil {
+		return nil, err
+	}
 	if len(msg.Question) == 0 {
 		return nil, errors.New("no question found")
 	}
 	domain := strings.TrimSuffix(msg.Question[0].Name, ".")
 	qtype := msg.Question[0].Qtype
 
-	// Unique key for the singleflight group.
-	key := fmt.Sprintf("%s:%d:", domain, qtype)
+	// Unique key for the singleflight group. The EDNS Client Subnet is part of
+	// the key so subnet-specific answers are neither coalesced nor hot-cached
+	// across different subnets (RFC 7871 §7.3).
+	key := fmt.Sprintf("%s:%d:%s", domain, qtype, dnscache.CanonicalECS(msg))
+	// A LAN-only query must not join, or be answered from the hot cache of, an
+	// ordinary query for the same name: that answer may have come from a public
+	// nameserver.
+	if isLanOnlyQuery(ctx) {
+		key += ":lan-only"
+	}
 
 	// Checking the cache first.
 	if val, ok := o.cache.Load(key); ok {
@@ -351,6 +671,10 @@ func (o *osResolver) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error
 	if p := o.lanServers.Load(); p != nil {
 		nss = append(nss, (*p)...)
 	}
+	// A LAN-only query is never sent to a public nameserver.
+	if isLanOnlyQuery(ctx) {
+		publicServers = nil
+	}
 	numServers := len(nss) + len(publicServers)
 
 	// If this is a LAN query, skip public DNS.
@@ -380,6 +704,14 @@ func (o *osResolver) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error
 
 	ch := make(chan *osResolverResult, numServers)
 	wg := &sync.WaitGroup{}
+	exchange := o.exchangeDNS
+	if exchange == nil {
+		exchange = exchangeDNS
+	}
+	localIPForServer := o.localIP
+	if localIPForServer == nil {
+		localIPForServer = defaultLocalIPForServer
+	}
 	wg.Add(numServers)
 	go func() {
 		wg.Wait()
@@ -390,22 +722,17 @@ func (o *osResolver) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error
 		for _, server := range servers {
 			go func(server string) {
 				defer wg.Done()
+				release, ok := acquireOSResolverExchangeSlot(ctx)
+				if !ok {
+					ch <- &osResolverResult{err: ctx.Err(), server: server, lan: isLan}
+					return
+				}
+				defer release()
+
 				var answer *dns.Msg
 				var err error
-				var localOSResolverIP net.IP
-				if runtime.GOOS == "darwin" {
-					host, _, err := net.SplitHostPort(server)
-					if err == nil {
-						ip := net.ParseIP(host)
-						if ip != nil && ip.To4() == nil {
-							// IPv6 nameserver; use default IPv6 address (if set)
-							localOSResolverIP = GetDefaultLocalIPv6()
-						} else {
-							localOSResolverIP = GetDefaultLocalIPv4()
-						}
-					}
-				}
-				answer, _, err = customDNSExchange(ctx, msg.Copy(), server, localOSResolverIP)
+				localOSResolverIP := localIPForServer(server)
+				answer, _, err = customDNSExchangeWith(ctx, msg.Copy(), server, localOSResolverIP, allowRouteSelectedRetryForOSServer(server), exchange)
 				ch <- &osResolverResult{answer: answer, err: err, server: server, lan: isLan}
 			}(server)
 		}
@@ -500,6 +827,15 @@ func (o *osResolver) resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error
 	return nil, errors.Join(errs...)
 }
 
+func acquireOSResolverExchangeSlot(ctx context.Context) (func(), bool) {
+	select {
+	case osResolverExchangeSem <- struct{}{}:
+		return func() { <-osResolverExchangeSem }, true
+	case <-ctx.Done():
+		return nil, false
+	}
+}
+
 func (o *osResolver) removeCache(key string) {
 	o.cache.Delete(key)
 }
@@ -509,6 +845,10 @@ type legacyResolver struct {
 }
 
 func (r *legacyResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	if err := validateMsg(msg); err != nil {
+		return nil, err
+	}
+
 	// See comment in (*dotResolver).resolve method.
 	dialer := newDialer(net.JoinHostPort(controldPublicDns, "53"))
 	dnsTyp := uint16(0)
@@ -534,6 +874,9 @@ func (r *legacyResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, e
 type dummyResolver struct{}
 
 func (d dummyResolver) Resolve(ctx context.Context, msg *dns.Msg) (*dns.Msg, error) {
+	if err := validateMsg(msg); err != nil {
+		return nil, err
+	}
 	ans := new(dns.Msg)
 	ans.SetReply(msg)
 	return ans, nil
@@ -553,7 +896,7 @@ func initDefaultOsResolver() []string {
 	defer resolverMutex.Unlock()
 	if or == nil {
 		ProxyLogger.Load().Debug().Msgf("Initialize new OS resolver with default nameservers")
-		or = newResolverWithNameserver(defaultNameservers())
+		storeOsResolver(newResolverWithNameserver(defaultNameservers()))
 	}
 	nss := *or.lanServers.Load()
 	nss = append(nss, *or.publicServers.Load()...)
@@ -768,4 +1111,14 @@ func isLanAddr(addr netip.Addr) bool {
 		addr.IsLoopback() ||
 		addr.IsLinkLocalUnicast() ||
 		tsaddr.CGNATRange().Contains(addr)
+}
+
+func validateMsg(msg *dns.Msg) error {
+	if msg == nil {
+		return errors.New("nil DNS message")
+	}
+	if len(msg.Question) == 0 {
+		return errors.New("no question found")
+	}
+	return nil
 }
